@@ -38,8 +38,9 @@ pub struct ZoneBound {
     // as the local offset. To get the actual first row address,
     // use `(fragment_id << 32) | start`.
     pub start: u64,
-    // length is the `row offset span` between the first and the last row in the zone
-    // calculated as: (last_row_offset - first_row_offset + 1)
+    // length is the span of row offsets between the first and last row in the zone,
+    // calculated as (last_row_offset - first_row_offset + 1). It is not the count
+    // of physical rows, since deletions may create gaps within the span.
     pub length: usize,
 }
 
@@ -315,7 +316,6 @@ where
     P::ZoneStatistics: Clone,
 {
     let mut combined = existing.to_vec();
-    let trainer = trainer;
     let mut new_zones = trainer.train(stream).await?;
     combined.append(&mut new_zones);
     Ok(combined)
@@ -785,6 +785,49 @@ mod tests {
         assert!(!map.contains((2_u64 << 32) + 11));
     }
 
+    #[test]
+    fn search_zones_returns_empty_when_no_match() {
+        #[derive(Debug)]
+        struct DummyZone {
+            bound: ZoneBound,
+            matches: bool,
+        }
+
+        impl AsRef<ZoneBound> for DummyZone {
+            fn as_ref(&self) -> &ZoneBound {
+                &self.bound
+            }
+        }
+
+        // Both zones are marked as non-matching. The helper should return an empty map.
+        let zones = vec![
+            DummyZone {
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 4,
+                },
+                matches: false,
+            },
+            DummyZone {
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 10,
+                    length: 2,
+                },
+                matches: false,
+            },
+        ];
+
+        let metrics = LocalMetricsCollector::default();
+        let result = search_zones(&zones, &metrics, |zone| Ok(zone.matches)).unwrap();
+        let SearchResult::AtMost(map) = result else {
+            panic!("expected AtMost result");
+        };
+        // No zones should be inserted when every predicate evaluates to false
+        assert!(map.is_empty());
+    }
+
     #[tokio::test]
     async fn rebuild_zones_appends_new_stats() {
         let existing = vec![MockStats {
@@ -804,11 +847,42 @@ mod tests {
 
         let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
         let rebuilt = rebuild_zones(&existing, trainer, stream).await.unwrap();
+        // Existing zone should remain unchanged and new stats appended afterwards
         assert_eq!(rebuilt.len(), 2);
         assert_eq!(rebuilt[0].sum, 50);
         assert_eq!(rebuilt[1].sum, 7);
         assert_eq!(rebuilt[1].bound.fragment_id, 1);
         assert_eq!(rebuilt[1].bound.start, 0);
         assert_eq!(rebuilt[1].bound.length, 2);
+    }
+
+    #[tokio::test]
+    async fn rebuild_zones_handles_multi_fragment_stream() {
+        let existing = vec![MockStats {
+            sum: 10,
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 1,
+            },
+        }];
+
+        // Construct a stream with two fragments. Trainer should emit two zones that
+        // get appended after the existing entries.
+        let batch = batch(vec![5, 5, 6, 6], vec![1, 1, 2, 2], vec![0, 1, 0, 1]);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::once(async { Ok(batch) }),
+        ));
+
+        let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
+        let rebuilt = rebuild_zones(&existing, trainer, stream).await.unwrap();
+        // Existing zone plus two new fragments should yield three total zones
+        assert_eq!(rebuilt.len(), 3);
+        assert_eq!(rebuilt[0].bound.fragment_id, 0);
+        assert_eq!(rebuilt[1].bound.fragment_id, 1);
+        assert_eq!(rebuilt[2].bound.fragment_id, 2);
+        assert_eq!(rebuilt[1].sum, 10);
+        assert_eq!(rebuilt[2].sum, 12);
     }
 }
