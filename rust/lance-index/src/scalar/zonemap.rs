@@ -39,12 +39,12 @@ use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::Error;
 use lance_core::Result;
-use lance_core::{utils::mask::RowAddrTreeMap, Error};
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer};
+use super::zoned::{search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
@@ -59,8 +59,10 @@ struct ZoneMapStatistics {
     null_count: u32,
     // only apply to float type
     nan_count: u32,
-    // Span of this zone within the fragment
-    span: ZoneBound,
+    /// Bound of this zone within the fragment. It combines the persisted
+    /// `(fragment_id, zone_start, zone_length)` columns that are written to
+    /// `zonemap.lance`, matching the former `zone_*` fields.
+    bound: ZoneBound,
 }
 
 impl DeepSizeOf for ZoneMapStatistics {
@@ -70,6 +72,12 @@ impl DeepSizeOf for ZoneMapStatistics {
         let max_size = self.max.size() - std::mem::size_of::<ScalarValue>();
 
         min_size + max_size
+    }
+}
+
+impl AsRef<ZoneBound> for ZoneMapStatistics {
+    fn as_ref(&self) -> &ZoneBound {
+        &self.bound
     }
 }
 
@@ -460,7 +468,7 @@ impl ZoneMapIndex {
                 max,
                 null_count,
                 nan_count,
-                span: ZoneBound {
+                bound: ZoneBound {
                     fragment_id: fragment_id_col.value(i),
                     start: zone_start_col.value(i),
                     length: zone_length.value(i) as usize,
@@ -517,7 +525,7 @@ impl Index for ZoneMapIndex {
 
         // Loop through zones and add unique fragment IDs to the bitmap
         for zone in &self.zones {
-            frag_ids.insert(zone.span.fragment_id as u32);
+            frag_ids.insert(zone.bound.fragment_id as u32);
         }
 
         Ok(frag_ids)
@@ -531,25 +539,10 @@ impl ScalarIndex for ZoneMapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-
-        let mut row_addr_tree_map = RowAddrTreeMap::new();
-
-        // Loop through zones and check each one
-        for zone in self.zones.iter() {
-            // Check if this zone matches the query
-            if self.evaluate_zone_against_query(zone, query)? {
-                // Calculate the range of row addresses for this zone
-                let zone_start_addr = (zone.span.fragment_id << 32) + zone.span.start;
-                let zone_end_addr = zone_start_addr + zone.span.length as u64;
-
-                // Add all row addresses in this zone to the result
-                row_addr_tree_map.insert_range(zone_start_addr..zone_end_addr);
-            }
-        }
-
-        Ok(SearchResult::AtMost(row_addr_tree_map))
+        search_zones(&self.zones, metrics, |zone| {
+            self.evaluate_zone_against_query(zone, query)
+        })
     }
 
     fn can_remap(&self) -> bool {
@@ -702,13 +695,13 @@ impl ZoneMapIndexBuilder {
         let nan_counts = UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.nan_count));
 
         let fragment_ids =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.span.fragment_id));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.fragment_id));
 
         let zone_lengths =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.span.length as u64));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.length as u64));
 
         let zone_starts =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.span.start));
+            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.start));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             // min and max can be null if the entire batch is null values
@@ -813,13 +806,13 @@ impl ZoneProcessor for ZoneMapProcessor {
         Ok(())
     }
 
-    fn finish_zone(&mut self, span: ZoneBound) -> Result<Self::ZoneStatistics> {
+    fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
         Ok(ZoneMapStatistics {
             min: self.min.evaluate()?,
             max: self.max.evaluate()?,
             null_count: self.null_count,
             nan_count: self.nan_count,
-            span,
+            bound,
         })
     }
 
@@ -1092,8 +1085,8 @@ mod tests {
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.null_count, 1000);
             assert_eq!(zone.nan_count, 0, "Zone {} should have nan_count = 0", i);
-            assert_eq!(zone.span.length, 5000);
-            assert_eq!(zone.span.fragment_id, i as u64);
+            assert_eq!(zone.bound.length, 5000);
+            assert_eq!(zone.bound.fragment_id, i as u64);
         }
 
         // Equals query: null (should match all zones since they contain null values)
@@ -1146,8 +1139,8 @@ mod tests {
 
         // Verify the new zone was added
         let new_zone = &updated_index.zones[10]; // Last zone should be the new one
-        assert_eq!(new_zone.span.fragment_id, 10u64); // New fragment ID
-        assert_eq!(new_zone.span.length, 5000);
+        assert_eq!(new_zone.bound.fragment_id, 10u64); // New fragment ID
+        assert_eq!(new_zone.bound.length, 5000);
         assert_eq!(new_zone.null_count, 0); // New data has no nulls
         assert_eq!(new_zone.nan_count, 0); // New data has no NaN values
 
@@ -1241,12 +1234,12 @@ mod tests {
         for (i, zone) in index.zones.iter().enumerate() {
             assert_eq!(zone.nan_count, 20, "Zone {} should have 20 NaN values", i);
             assert_eq!(
-                zone.span.length, 100,
+                zone.bound.length, 100,
                 "Zone {} should have zone_length 100",
                 i
             );
             assert_eq!(
-                zone.span.fragment_id, 0u64,
+                zone.bound.fragment_id, 0u64,
                 "Zone {} should have fragment_id 0",
                 i
             );
@@ -1464,7 +1457,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(99)),
                     null_count: 0,
                     nan_count: 0,
-                    span: ZoneBound {
+                    bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
                         length: 100,
@@ -1475,7 +1468,7 @@ mod tests {
                     max: ScalarValue::Int32(Some(100)),
                     null_count: 0,
                     nan_count: 0,
-                    span: ZoneBound {
+                    bound: ZoneBound {
                         fragment_id: 0,
                         start: 100,
                         length: 1,
@@ -1646,7 +1639,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(8191)),
                     null_count: 0,
                     nan_count: 0,
-                    span: ZoneBound {
+                    bound: ZoneBound {
                         fragment_id: 0,
                         start: 0,
                         length: 8192,
@@ -1657,7 +1650,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16383)),
                     null_count: 0,
                     nan_count: 0,
-                    span: ZoneBound {
+                    bound: ZoneBound {
                         fragment_id: 0,
                         start: 8192,
                         length: 8192,
@@ -1668,7 +1661,7 @@ mod tests {
                     max: ScalarValue::Int64(Some(16425)),
                     null_count: 0,
                     nan_count: 0,
-                    span: ZoneBound {
+                    bound: ZoneBound {
                         fragment_id: 0,
                         start: 16384,
                         length: 42,
@@ -1806,7 +1799,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(4999)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
                             length: 5000,
@@ -1817,7 +1810,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 0,
                             start: 5000,
                             length: 3192,
@@ -1828,7 +1821,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(13191)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
                             length: 5000,
@@ -1839,7 +1832,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 1,
                             start: 5000,
                             length: 3192,
@@ -1850,7 +1843,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
                             length: 42,
@@ -2014,7 +2007,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
                             length: 8192,
@@ -2025,7 +2018,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
                             length: 8192,
@@ -2036,7 +2029,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
                             length: 42,
@@ -2089,7 +2082,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(8191)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 0,
                             start: 0,
                             length: 8192,
@@ -2100,7 +2093,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16383)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 1,
                             start: 0,
                             length: 8192,
@@ -2111,7 +2104,7 @@ mod tests {
                         max: ScalarValue::Int64(Some(16425)),
                         null_count: 0,
                         nan_count: 0,
-                        span: ZoneBound {
+                        bound: ZoneBound {
                             fragment_id: 2,
                             start: 0,
                             length: 42,

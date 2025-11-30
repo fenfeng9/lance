@@ -17,8 +17,6 @@ use crate::scalar::{
 };
 use crate::{pb, Any};
 use arrow_array::{Array, UInt64Array};
-use lance_core::utils::mask::RowAddrTreeMap;
-use lance_core::ROW_ADDR;
 mod as_bytes;
 mod sbbf;
 use arrow_schema::{DataType, Field};
@@ -42,7 +40,7 @@ use lance_core::Result;
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer};
+use super::zoned::{search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -51,7 +49,9 @@ const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
 #[derive(Debug, Clone)]
 struct BloomFilterStatistics {
-    // Bound of this zone within the fragment
+    // Bound of this zone within the fragment. This combines the persisted
+    // `(fragment_id, zone_start, zone_length)` columns that are written to
+    // `bloomfilter.lance`, matching the previous `zone_*` fields.
     bound: ZoneBound,
     // Whether this zone contains any null values
     has_null: bool,
@@ -65,6 +65,12 @@ impl DeepSizeOf for BloomFilterStatistics {
         // We could try to get the actual size from the Sbbf if it has a method for that,
         // but for now we'll estimate based on the number of bytes it serializes to
         self.bloom_filter.to_bytes().len()
+    }
+}
+
+impl AsRef<ZoneBound> for BloomFilterStatistics {
+    fn as_ref(&self) -> &ZoneBound {
+        &self.bound
     }
 }
 
@@ -460,23 +466,10 @@ impl ScalarIndex for BloomFilterIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        metrics.record_comparisons(self.zones.len());
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-
-        let mut row_addr_tree_map = RowAddrTreeMap::new();
-
-        // For each zone, check if it might contain the queried value
-        for block in self.zones.iter() {
-            if self.evaluate_block_against_query(block, query)? {
-                let zone_start_addr = (block.bound.fragment_id << 32) + block.bound.start;
-                let zone_end_addr = zone_start_addr + block.bound.length as u64;
-
-                // Add all row addresses in this zone to the result
-                row_addr_tree_map.insert_range(zone_start_addr..zone_end_addr);
-            }
-        }
-
-        Ok(SearchResult::AtMost(row_addr_tree_map))
+        search_zones(&self.zones, metrics, |block| {
+            self.evaluate_block_against_query(block, query)
+        })
     }
 
     fn can_remap(&self) -> bool {

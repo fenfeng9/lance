@@ -12,6 +12,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Result, ROW_ADDR};
 use lance_datafusion::chunker::chunk_concat_stream;
 use snafu::location;
@@ -35,7 +36,7 @@ pub struct ZoneBound {
     pub fragment_id: u64,
     // start is start row of the zone in the fragment, also known
     // as the local offset. To get the actual first row address,
-    // you can do `fragment_id << 32 + start`
+    // use `(fragment_id << 32) | start`.
     pub start: u64,
     // length is the `row offset span` between the first and the last row in the zone
     // calculated as: (last_row_offset - first_row_offset + 1)
@@ -83,6 +84,12 @@ where
 
     /// Consume the `_rowaddr`-annotated stream, split it into zones, and let the
     /// processor compute zone statistics.
+    ///
+    /// The caller must provide record batches where the first column is the
+    /// value array that the zone processor understands, and the schema includes
+    /// the `_rowaddr` column with physical row addresses. Future zone-based
+    /// indexes should maintain this ordering or extend the trainer to accept an
+    /// explicit column index.
     pub async fn train(
         mut self,
         stream: SendableRecordBatchStream,
@@ -263,9 +270,42 @@ where
     }
 }
 
+/// Shared search helper that loops over zones, records metrics, and
+/// collects row address ranges for matching zones. The result is always
+/// returned as `SearchResult::AtMost` because zone-level pruning can only
+/// guarantee a superset of the true matches.
+pub fn search_zones<T, F>(
+    zones: &[T],
+    metrics: &dyn crate::metrics::MetricsCollector,
+    mut zone_matches: F,
+) -> Result<crate::scalar::SearchResult>
+where
+    T: AsRef<ZoneBound>,
+    F: FnMut(&T) -> Result<bool>,
+{
+    metrics.record_comparisons(zones.len());
+    let mut row_id_tree_map = RowIdTreeMap::new();
+
+    // For each zone, check if it might contain the queried value
+    for zone in zones {
+        if zone_matches(zone)? {
+            let bound = zone.as_ref();
+            // Calculate the range of row addresses for this zone
+            let zone_start_addr = (bound.fragment_id << 32) + bound.start;
+            let zone_end_addr = zone_start_addr + bound.length as u64;
+
+            // Add all row addresses in this zone to the result
+            row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
+        }
+    }
+
+    Ok(crate::scalar::SearchResult::AtMost(row_id_tree_map))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{metrics::LocalMetricsCollector, scalar::SearchResult};
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -662,5 +702,67 @@ mod tests {
         assert_eq!(stats[2].bound.start, 0);
         assert_eq!(stats[2].bound.length, 2);
         assert_eq!(stats[2].sum, 6);
+    }
+
+    #[test]
+    fn search_zones_collects_row_ranges() {
+        // Ensure the shared helper converts matching zones into the correct row-id
+        // ranges (fragment upper bits + local offsets) while skipping non-matching
+        // zones. This protects the helper if we modify how RowIdTreeMap ranges are
+        // inserted in the future.
+        #[derive(Debug)]
+        struct DummyZone {
+            bound: ZoneBound,
+            matches: bool,
+        }
+
+        impl AsRef<ZoneBound> for DummyZone {
+            fn as_ref(&self) -> &ZoneBound {
+                &self.bound
+            }
+        }
+
+        let zones = vec![
+            DummyZone {
+                bound: ZoneBound {
+                    fragment_id: 0,
+                    start: 0,
+                    length: 2,
+                },
+                matches: true,
+            },
+            DummyZone {
+                bound: ZoneBound {
+                    fragment_id: 1,
+                    start: 5,
+                    length: 3,
+                },
+                matches: false,
+            },
+            DummyZone {
+                bound: ZoneBound {
+                    fragment_id: 2,
+                    start: 10,
+                    length: 1,
+                },
+                matches: true,
+            },
+        ];
+
+        let metrics = LocalMetricsCollector::default();
+        let result = search_zones(&zones, &metrics, |zone| Ok(zone.matches)).unwrap();
+        let SearchResult::AtMost(map) = result else {
+            panic!("search_zones should return AtMost for dummy zones");
+        };
+
+        // Fragment 0, offsets 0 and 1
+        assert!(map.contains(0));
+        assert!(map.contains(1));
+        // Fragment 1 should be skipped entirely
+        assert!(!map.contains((1_u64 << 32) + 5));
+        assert!(!map.contains((1_u64 << 32) + 7));
+        // Fragment 2 includes only the single offset 10
+        assert!(map.contains((2_u64 << 32) + 10));
+        assert!(!map.contains((2_u64 << 32) + 11));
     }
 }
