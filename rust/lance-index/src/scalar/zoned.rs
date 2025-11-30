@@ -302,6 +302,25 @@ where
     Ok(crate::scalar::SearchResult::AtMost(row_id_tree_map))
 }
 
+/// Helper that retrains zones from `stream` and appends them to the existing
+/// statistics. Useful for index update paths that need to merge new fragments
+/// into an existing zone list.
+pub async fn rebuild_zones<P>(
+    existing: &[P::ZoneStatistics],
+    trainer: ZoneTrainer<P>,
+    stream: SendableRecordBatchStream,
+) -> Result<Vec<P::ZoneStatistics>>
+where
+    P: ZoneProcessor,
+    P::ZoneStatistics: Clone,
+{
+    let mut combined = existing.to_vec();
+    let trainer = trainer;
+    let mut new_zones = trainer.train(stream).await?;
+    combined.append(&mut new_zones);
+    Ok(combined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,5 +783,32 @@ mod tests {
         // Fragment 2 includes only the single offset 10
         assert!(map.contains((2_u64 << 32) + 10));
         assert!(!map.contains((2_u64 << 32) + 11));
+    }
+
+    #[tokio::test]
+    async fn rebuild_zones_appends_new_stats() {
+        let existing = vec![MockStats {
+            sum: 50,
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 2,
+            },
+        }];
+
+        let batch = batch(vec![3, 4], vec![1, 1], vec![0, 1]);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::once(async { Ok(batch) }),
+        ));
+
+        let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
+        let rebuilt = rebuild_zones(&existing, trainer, stream).await.unwrap();
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(rebuilt[0].sum, 50);
+        assert_eq!(rebuilt[1].sum, 7);
+        assert_eq!(rebuilt[1].bound.fragment_id, 1);
+        assert_eq!(rebuilt[1].bound.start, 0);
+        assert_eq!(rebuilt[1].bound.length, 2);
     }
 }

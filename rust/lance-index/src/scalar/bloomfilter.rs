@@ -40,7 +40,7 @@ use lance_core::Result;
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use super::zoned::{search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
+use super::zoned::{rebuild_zones, search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -492,33 +492,20 @@ impl ScalarIndex for BloomFilterIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // 1. Prepare the builder for new bloom filters
-        let batches_source = new_data;
-
-        let mut builder = BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
+        // Re-train bloom filters for the appended data using the shared trainer
+        let params = BloomFilterIndexBuilderParams {
             number_of_items: self.number_of_items,
             probability: self.probability,
-        })?;
+        };
 
-        builder.train(batches_source).await?;
+        let processor = BloomFilterProcessor::new(params.clone())?;
+        let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
+        let updated_blocks = rebuild_zones(&self.zones, trainer, new_data).await?;
 
-        // Get the new blocks from the builder
-        let new_blocks = builder.blocks;
-
-        // Combine existing zones with new zones
-        let mut all_blocks = self.zones.clone();
-        all_blocks.extend(new_blocks);
-
-        // Create a new builder with all blocks to write them out
-        let mut combined_builder =
-            BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams {
-                number_of_items: self.number_of_items,
-                probability: self.probability,
-            })?;
-        combined_builder.blocks = all_blocks;
-
-        // Write the updated index to dest_store
-        combined_builder.write_index(dest_store).await?;
+        // Write the combined zones back to storage
+        let mut builder = BloomFilterIndexBuilder::try_new(params)?;
+        builder.blocks = updated_blocks;
+        builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())

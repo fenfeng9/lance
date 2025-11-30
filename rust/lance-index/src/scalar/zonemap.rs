@@ -44,7 +44,7 @@ use lance_core::Result;
 use roaring::RoaringBitmap;
 use snafu::location;
 
-use super::zoned::{search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
+use super::zoned::{rebuild_zones, search_zones, ZoneBound, ZoneProcessor, ZoneTrainer};
 const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
@@ -567,34 +567,20 @@ impl ScalarIndex for ZoneMapIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // Process the new data to create zones
-        let batches_source = new_data;
-        let value_type = batches_source.schema().field(0).data_type().clone();
+        // Train new zones for the incoming data stream
+        let schema = new_data.schema();
+        let value_type = schema.field(0).data_type().clone();
 
-        let mut builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderParams::new(self.rows_per_zone),
-            value_type,
-        )?;
+        let options = ZoneMapIndexBuilderParams::new(self.rows_per_zone);
+        let processor = ZoneMapProcessor::new(value_type.clone())?;
+        let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?;
+        let updated_zones = rebuild_zones(&self.zones, trainer, new_data).await?;
 
-        builder.train(batches_source).await?;
-
-        // Get the new zones from the builder
-        let new_zone_stats = builder.maps;
-
-        // Combine existing zones with new zones
-        let mut all_zones = self.zones.clone();
-        all_zones.extend(new_zone_stats);
-
-        // Create a new builder with all zones to write them out
-        let mut combined_builder = ZoneMapIndexBuilder::try_new(
-            ZoneMapIndexBuilderParams::new(self.rows_per_zone),
-            self.data_type.clone(),
-        )?;
-        combined_builder.maps = all_zones;
-        combined_builder.options.rows_per_zone = self.rows_per_zone;
-
-        // Write the updated index to dest_store
-        combined_builder.write_index(dest_store).await?;
+        // Serialize the combined zones back into the index file
+        let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
+        builder.options.rows_per_zone = self.rows_per_zone;
+        builder.maps = updated_zones;
+        builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default())
