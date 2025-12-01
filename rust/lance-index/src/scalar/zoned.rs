@@ -377,7 +377,7 @@ mod tests {
         let val_array = Arc::new(Int32Array::from(values));
         let row_addrs: Vec<u64> = fragments
             .into_iter()
-            .zip(offsets.into_iter())
+            .zip(offsets)
             .map(|(frag, off)| (frag << 32) | off)
             .collect();
         let addr_array = Arc::new(UInt64Array::from(row_addrs));
