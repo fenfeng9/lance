@@ -169,8 +169,8 @@ where
                     .process_chunk(&values.slice(batch_offset, take))?;
 
                 // Track the first and last row offsets to handle non-contiguous offsets
-                // after deletions. Zone length is computed as (last - first + 1), not the
-                // actual row count.
+                // after deletions. Zone length (offset span) is computed as (last - first + 1),
+                // not the actual row count.
                 let first_offset =
                     RowAddress::new_from_u64(row_addr_col.value(batch_offset)).row_offset() as u64;
                 let last_offset =
@@ -254,6 +254,8 @@ where
         Ok(())
     }
 
+    /// Count how many consecutive rows belong to the same fragment starting from `start`.
+    /// Returns the number of rows before encountering a different fragment or reaching the end.
     fn count_run_length(
         row_addrs: &UInt64Array,
         start: usize,
@@ -402,7 +404,7 @@ mod tests {
         let trainer = ZoneTrainer::new(processor, 4).unwrap();
         let stats = trainer.train(stream).await.unwrap();
 
-        // Three zones: [0..3], [4..7], [8..9]
+        // Three zones: offsets [0..=3], [4..=7], [8..=9]
         assert_eq!(stats.len(), 3);
         assert_eq!(stats[0].bound.start, 0);
         assert_eq!(stats[0].bound.length, 4);
@@ -570,12 +572,12 @@ mod tests {
 
         // Two zones: first 4 rows, then remaining 2 rows
         assert_eq!(stats.len(), 2);
-        // First zone: rows 0-3
+        // First zone: offsets [0..=3]
         assert_eq!(stats[0].bound.fragment_id, 0);
         assert_eq!(stats[0].bound.start, 0);
         assert_eq!(stats[0].bound.length, 4);
         assert_eq!(stats[0].sum, 4);
-        // Second zone: rows 4-5
+        // Second zone: offsets [4..=5]
         assert_eq!(stats[1].bound.fragment_id, 0);
         assert_eq!(stats[1].bound.start, 4);
         assert_eq!(stats[1].bound.length, 2);
@@ -602,19 +604,19 @@ mod tests {
         // Three zones: frag 0 full zone, frag 0 partial (flushed at boundary), frag 1
         assert_eq!(stats.len(), 3);
 
-        // Zone 0: Fragment 0, rows 0-2 (fills capacity)
+        // Zone 0: Fragment 0, offsets [0..=2] (fills capacity)
         assert_eq!(stats[0].bound.fragment_id, 0);
         assert_eq!(stats[0].bound.start, 0);
         assert_eq!(stats[0].bound.length, 3);
         assert_eq!(stats[0].sum, 3);
 
-        // Zone 1: Fragment 0, row 3 (partial, flushed at fragment boundary)
+        // Zone 1: Fragment 0, offset 3 (partial, flushed at fragment boundary)
         assert_eq!(stats[1].bound.fragment_id, 0);
         assert_eq!(stats[1].bound.start, 3);
         assert_eq!(stats[1].bound.length, 1);
         assert_eq!(stats[1].sum, 1);
 
-        // Zone 2: Fragment 1, rows 0-1
+        // Zone 2: Fragment 1, offsets [0..=1]
         assert_eq!(stats[2].bound.fragment_id, 1);
         assert_eq!(stats[2].bound.start, 0);
         assert_eq!(stats[2].bound.length, 2);
@@ -645,13 +647,13 @@ mod tests {
         // Zone 1: rows at offsets [8, 9] (2 rows)
         assert_eq!(stats.len(), 2);
 
-        // First zone: 4 rows, but span is 7-0+1=8 (due to gaps)
+        // First zone: 4 rows, but offset span is [0..=7] so length=8 (due to gaps)
         assert_eq!(stats[0].sum, 4);
         assert_eq!(stats[0].bound.fragment_id, 0);
         assert_eq!(stats[0].bound.start, 0);
         assert_eq!(stats[0].bound.length, 8); // Address span: 7 - 0 + 1
 
-        // Second zone: 2 rows, span is 9-8+1=2
+        // Second zone: 2 rows, offset span is [8..=9] so length=2
         assert_eq!(stats[1].sum, 2);
         assert_eq!(stats[1].bound.fragment_id, 0);
         assert_eq!(stats[1].bound.start, 8);
@@ -675,7 +677,7 @@ mod tests {
         let trainer = ZoneTrainer::new(processor, 10).unwrap();
         let stats = trainer.train(stream).await.unwrap();
 
-        // One zone with 3 rows, but span of 201 due to large gaps
+        // One zone with 3 rows, but offset span [0..=200] so length=201 due to large gaps
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].sum, 3);
         assert_eq!(stats[0].bound.start, 0);
