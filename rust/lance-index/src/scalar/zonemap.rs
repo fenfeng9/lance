@@ -59,9 +59,8 @@ struct ZoneMapStatistics {
     null_count: u32,
     // only apply to float type
     nan_count: u32,
-    /// Bound of this zone within the fragment. It combines the persisted
-    /// `(fragment_id, zone_start, zone_length)` columns that are written to
-    /// `zonemap.lance`, matching the former `zone_*` fields.
+    // Bound of this zone within the fragment. Persisted as three separate columns
+    // (fragment_id, zone_start, zone_length) in the index file.
     bound: ZoneBound,
 }
 

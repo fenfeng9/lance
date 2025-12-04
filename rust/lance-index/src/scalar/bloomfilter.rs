@@ -49,9 +49,8 @@ const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
 #[derive(Debug, Clone)]
 struct BloomFilterStatistics {
-    // Bound of this zone within the fragment. This combines the persisted
-    // `(fragment_id, zone_start, zone_length)` columns that are written to
-    // `bloomfilter.lance`, matching the previous `zone_*` fields.
+    // Bound of this zone within the fragment. Persisted as three separate columns
+    // (fragment_id, zone_start, zone_length) in the index file.
     bound: ZoneBound,
     // Whether this zone contains any null values
     has_null: bool,

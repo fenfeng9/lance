@@ -150,12 +150,10 @@ where
                     _ => {}
                 }
 
-                let run_len = Self::count_run_length(
-                    row_addr_col,
-                    batch_offset,
-                    batch.num_rows(),
-                    fragment_id,
-                );
+                // Count consecutive rows in the same fragment
+                let run_len = (batch_offset..batch.num_rows())
+                    .take_while(|&idx| (row_addr_col.value(idx) >> 32) == fragment_id)
+                    .count();
                 let capacity = zone_size - current_zone_len;
                 let take = run_len.min(capacity);
 
@@ -252,24 +250,6 @@ where
         *zone_end_offset = None;
         processor.reset()?;
         Ok(())
-    }
-
-    /// Count how many consecutive rows belong to the same fragment starting from `start`.
-    /// Returns the number of rows before encountering a different fragment or reaching the end.
-    fn count_run_length(
-        row_addrs: &UInt64Array,
-        start: usize,
-        total: usize,
-        fragment_id: u64,
-    ) -> usize {
-        let mut idx = start;
-        while idx < total {
-            if (row_addrs.value(idx) >> 32) != fragment_id {
-                break;
-            }
-            idx += 1;
-        }
-        idx - start
     }
 }
 
