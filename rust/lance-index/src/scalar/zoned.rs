@@ -12,7 +12,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Result, ROW_ADDR};
 use lance_datafusion::chunker::chunk_concat_stream;
 use snafu::location;
@@ -287,7 +287,7 @@ where
     F: FnMut(&T) -> Result<bool>,
 {
     metrics.record_comparisons(zones.len());
-    let mut row_id_tree_map = RowIdTreeMap::new();
+    let mut row_addr_tree_map = RowAddrTreeMap::new();
 
     // For each zone, check if it might contain the queried value
     for zone in zones {
@@ -298,11 +298,11 @@ where
             let zone_end_addr = zone_start_addr + bound.length as u64;
 
             // Add all row addresses in this zone to the result
-            row_id_tree_map.insert_range(zone_start_addr..zone_end_addr);
+            row_addr_tree_map.insert_range(zone_start_addr..zone_end_addr);
         }
     }
 
-    Ok(crate::scalar::SearchResult::AtMost(row_id_tree_map))
+    Ok(crate::scalar::SearchResult::AtMost(row_addr_tree_map))
 }
 
 /// Helper that retrains zones from `stream` and appends them to the existing
@@ -729,7 +729,7 @@ mod tests {
     fn search_zones_collects_row_ranges() {
         // Ensure the shared helper converts matching zones into the correct row-id
         // ranges (fragment upper bits + local offsets) while skipping non-matching
-        // zones. This protects the helper if we modify how RowIdTreeMap ranges are
+        // zones. This protects the helper if we modify how RowAddrTreeMap ranges are
         // inserted in the future.
         #[derive(Debug)]
         struct DummyZone {
