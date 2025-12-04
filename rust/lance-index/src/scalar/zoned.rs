@@ -119,12 +119,10 @@ where
             let values = batch.column(0);
             let row_addr_col = batch
                 .column_by_name(ROW_ADDR)
-                .ok_or_else(|| Error::invalid_input("missing _rowaddr column", location!()))?
+                .unwrap()
                 .as_any()
                 .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    Error::invalid_input("_rowaddr column must be UInt64", location!())
-                })?;
+                .unwrap();
 
             let mut batch_offset = 0usize;
             while batch_offset < batch.num_rows() {
