@@ -129,17 +129,19 @@ where
                 let row_addr = row_addr_col.value(batch_offset);
                 let fragment_id = row_addr >> 32;
 
-                // Zones cannot span multiple fragments, flush when crossing boundary
+                // Zones cannot span fragments; flush current zone (if non-empty) at boundary
                 match current_fragment_id {
                     Some(current) if current != fragment_id => {
-                        Self::flush_zone(
-                            &mut self.processor,
-                            &mut zones,
-                            current,
-                            &mut current_zone_len,
-                            &mut zone_start_offset,
-                            &mut zone_end_offset,
-                        )?;
+                        if current_zone_len > 0 {
+                            Self::flush_zone(
+                                &mut self.processor,
+                                &mut zones,
+                                current,
+                                &mut current_zone_len,
+                                &mut zone_start_offset,
+                                &mut zone_end_offset,
+                            )?;
+                        }
                         current_fragment_id = Some(fragment_id);
                     }
                     None => {
@@ -206,6 +208,7 @@ where
         Ok(zones)
     }
 
+    /// Flushes a non-empty zone and resets the processor state.
     fn flush_zone(
         processor: &mut P,
         zones: &mut Vec<P::ZoneStatistics>,
@@ -214,13 +217,6 @@ where
         zone_start_offset: &mut Option<u64>,
         zone_end_offset: &mut Option<u64>,
     ) -> Result<()> {
-        if *current_zone_len == 0 {
-            processor.reset()?;
-            *zone_start_offset = None;
-            *zone_end_offset = None;
-            return Ok(());
-        }
-
         let start = zone_start_offset.unwrap_or(0);
         let inferred_end =
             zone_end_offset.unwrap_or_else(|| start + (*current_zone_len as u64).saturating_sub(1));
