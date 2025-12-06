@@ -155,12 +155,6 @@ where
                 let capacity = zone_size - current_zone_len;
                 let take = run_len.min(capacity);
 
-                if take == 0 {
-                    // Should not happen because flush occurs before reaching here,
-                    // but guard against infinite loops.
-                    break;
-                }
-
                 self.processor
                     .process_chunk(&values.slice(batch_offset, take))?;
 
