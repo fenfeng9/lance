@@ -1160,6 +1160,14 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
                 as Arc<dyn ScalarIndex>,
         )
     }
+
+    async fn load_statistics(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]

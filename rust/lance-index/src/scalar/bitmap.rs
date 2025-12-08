@@ -48,6 +48,7 @@ use crate::{metrics::MetricsCollector, Index, IndexType};
 use crate::{scalar::expression::ScalarQueryParser, scalar::IndexReader};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
+pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 
 const MAX_BITMAP_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024; // leave headroom
 
@@ -620,6 +621,7 @@ impl BitmapIndexPlugin {
         index_store: &dyn IndexStore,
         value_type: &DataType,
     ) -> Result<()> {
+        let num_bitmaps = state.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("keys", value_type.clone(), true),
             Field::new("bitmaps", DataType::Binary, true),
@@ -672,8 +674,17 @@ impl BitmapIndexPlugin {
             bitmap_index_file.write_record_batch(record_batch).await?;
         }
 
-        // Finish file once at the end - this creates the file even if we wrote no batches
-        bitmap_index_file.finish().await?;
+        // Finish file with metadata that allows lightweight statistics reads
+        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps }).map_err(|e| {
+            Error::Internal {
+                message: format!("failed to serialize bitmap statistics: {e}"),
+                location: location!(),
+            }
+        })?;
+        let mut metadata = HashMap::new();
+        metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
+
+        bitmap_index_file.finish_with_metadata(metadata).await?;
 
         Ok(())
     }
@@ -782,6 +793,23 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
+
+    async fn load_statistics(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<serde_json::Value>> {
+        let reader = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+        if let Some(value) = reader.schema().metadata.get(INDEX_STATS_METADATA_KEY) {
+            let stats = serde_json::from_str(value).map_err(|e| Error::Internal {
+                message: format!("failed to parse bitmap statistics metadata: {e}"),
+                location: location!(),
+            })?;
+            Ok(Some(stats))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -790,11 +818,12 @@ pub mod tests {
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::lance_format::LanceIndexStore;
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
