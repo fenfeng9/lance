@@ -490,13 +490,15 @@ impl ScalarQueryParser for LabelListQueryParser {
         if args.len() != 2 {
             return None;
         }
+        // DataFusion normalizes array_contains to array_has
         if func.name() == "array_has" {
             let inner_type = match data_type {
                 DataType::List(field) | DataType::LargeList(field) => field.data_type(),
                 _ => return None,
             };
             let scalar = maybe_scalar(&args[1], inner_type)?;
-            // Do not push down NULL needles.
+            // array_has(..., NULL) returns no matches in datafusion, but the index would
+            // match rows containing NULL. Fallback to match datafusion behavior.
             if scalar.is_null() {
                 return None;
             }

@@ -1981,7 +1981,7 @@ def test_label_list_index_array_contains(tmp_path: Path):
     # Include lists with NULL items to ensure NULL needle behavior matches
     # non-index execution.
     tbl = pa.table(
-        {"labels": [["foo", "bar"], ["bar"], ["baz"], ["qux", None], [None], []]}
+        {"labels": [["foo", "bar"], ["bar"], ["baz"], ["qux", None], [None], [], None]}
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
     expected_null_rows = dataset.to_table(
