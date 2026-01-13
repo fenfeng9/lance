@@ -445,7 +445,7 @@ impl FileReader {
     fn decode_footer(footer_bytes: &Bytes) -> Result<Footer> {
         let len = footer_bytes.len();
         if len < FOOTER_LEN {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "does not have sufficient data, len: {}, bytes: {:?}",
                     len, footer_bytes
@@ -474,7 +474,7 @@ impl FileReader {
 
         let magic_bytes = footer_bytes.slice(len - 4..);
         if magic_bytes.as_ref() != MAGIC {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "file does not appear to be a Lance file (invalid magic: {:?})",
                     MAGIC

@@ -3073,7 +3073,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .as_ref()
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
-                    Error::io(
+                    Error::invalid_input(
                         "required field (old_id) missing from message".to_string(),
                         location!(),
                     )
@@ -3083,7 +3083,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 .as_ref()
                 .map(Uuid::try_from)
                 .ok_or_else(|| {
-                    Error::io(
+                    Error::invalid_input(
                         "required field (new_id) missing from message".to_string(),
                         location!(),
                     )

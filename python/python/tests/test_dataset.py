@@ -108,6 +108,24 @@ def test_dataset_overwrite(tmp_path: Path):
     assert ds_v1.to_table() == table1
 
 
+def test_truncate_table(tmp_path: Path):
+    base_dir = tmp_path / "truncate"
+    table = pa.table(
+        {
+            "i": pa.array([1, 2, 3], pa.int32()),
+            "dict": pa.DictionaryArray.from_arrays(
+                pa.array([0, 1, 2], pa.uint16()), pa.array(["a", "b", "c"])
+            ),
+        }
+    )
+    ds = lance.write_dataset(table, base_dir, data_storage_version="stable")
+    assert ds.count_rows() == 3
+
+    ds.truncate_table()
+    assert ds.count_rows() == 0
+    assert ds.schema == table.schema
+
+
 def test_dataset_append(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"

@@ -815,7 +815,7 @@ impl Scanner {
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
         if self.is_fragment_scan() {
-            Err(Error::io(
+            Err(Error::not_supported(
                 "This operation is not supported for fragment scan".to_string(),
                 location!(),
             ))
@@ -1730,7 +1730,7 @@ impl Scanner {
                     .column(0)
                     .as_any()
                     .downcast_ref::<Int64Array>()
-                    .ok_or(Error::io(
+                    .ok_or(Error::invalid_input(
                         "Count plan did not return a UInt64Array".to_string(),
                         location!(),
                     ))?;
@@ -4008,9 +4008,7 @@ impl Stream for DatasetRecordBatchStream {
         let mut this = self.project();
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
-            Poll::Ready(result) => {
-                Poll::Ready(result.map(|r| r.map_err(|e| Error::io(e.to_string(), location!()))))
-            }
+            Poll::Ready(result) => Poll::Ready(result.map(|r| Ok(r?))),
             Poll::Pending => Poll::Pending,
         }
     }

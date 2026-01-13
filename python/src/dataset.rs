@@ -347,11 +347,14 @@ pub fn transforms_from_python(
                 let result = udf_obj
                     .call_method1(py, "_call", (py_batch,))
                     .map_err(|err| {
-                        lance::Error::io(format_python_error(err, py).unwrap(), location!())
+                        lance::Error::invalid_input(
+                            format_python_error(err, py).unwrap(),
+                            location!(),
+                        )
                     })?;
                 let result_batch: PyArrowType<RecordBatch> = result
                     .extract(py)
-                    .map_err(|err| lance::Error::io(err.to_string(), location!()))?;
+                    .map_err(|err| lance::Error::invalid_input(err.to_string(), location!()))?;
                 Ok(result_batch.0)
             })
         };
@@ -1546,6 +1549,15 @@ impl Dataset {
     fn restore(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.restore())?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    /// Truncate the dataset by deleting all rows. The schema is preserved and a new version is created.
+    fn truncate_table(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.truncate_table())?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
@@ -3398,7 +3410,7 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::io(
+            lance::Error::invalid_input(
                 format!("Failed to call begin() on WriteFragmentProgress: {}", e),
                 location!(),
             )
@@ -3415,7 +3427,7 @@ impl WriteFragmentProgress for PyWriteProgress {
             Ok(())
         })
         .map_err(|e| {
-            lance::Error::io(
+            lance::Error::invalid_input(
                 format!("Failed to call complete() on WriteFragmentProgress: {}", e),
                 location!(),
             )
@@ -3459,7 +3471,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(batch.map(|b| b.0))
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!("Failed to call get_batch() on UDFCheckpointer: {}", err),
                 location!(),
             )
@@ -3475,7 +3487,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(fragment)
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!("Failed to call get_fragment() on UDFCheckpointer: {}", err),
                 location!(),
             )
@@ -3483,7 +3495,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
         fragment_data
             .map(|data| {
                 serde_json::from_str(&data).map_err(|err| {
-                    lance::Error::io(
+                    lance_core::Error::invalid_input(
                         format!("Failed to deserialize fragment data: {}", err),
                         location!(),
                     )
@@ -3500,7 +3512,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!("Failed to call insert_batch() on UDFCheckpointer: {}", err),
                 location!(),
             )
@@ -3520,7 +3532,7 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             Ok(())
         })
         .map_err(|err: PyErr| {
-            lance_core::Error::io(
+            lance_core::Error::invalid_input(
                 format!(
                     "Failed to call insert_fragment() on UDFCheckpointer: {}",
                     err
