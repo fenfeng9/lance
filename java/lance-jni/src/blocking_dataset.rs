@@ -176,7 +176,7 @@ impl BlockingDataset {
             }),
             None,
             Default::default(),
-            false, // TODO: support enable_v2_manifest_paths
+            false,
         ))?;
         Ok(Self { inner })
     }
@@ -285,11 +285,13 @@ impl BlockingDataset {
         transaction: Transaction,
         store_params: ObjectStoreParams,
         detached: bool,
+        enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         let new_dataset = RT.block_on(
             CommitBuilder::new(Arc::new(self.clone().inner))
                 .with_store_params(store_params)
                 .with_detached(detached)
+                .enable_v2_manifest_paths(enable_v2_manifest_paths)
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })
@@ -411,6 +413,24 @@ pub extern "system" fn Java_org_lance_Dataset_drop<'local>(
         ok_or_throw!(env, extract_storage_options(&mut env, &storage_options_obj));
     ok_or_throw!(env, BlockingDataset::drop(&path_str, storage_options));
     JObject::null()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeMigrateManifestPathsV2(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_native_migrate_manifest_paths_v2(&mut env, java_dataset)
+    )
+}
+
+fn inner_native_migrate_manifest_paths_v2(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.migrate_manifest_paths_v2())?;
+    Ok(())
 }
 
 #[no_mangle]

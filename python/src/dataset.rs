@@ -2246,7 +2246,7 @@ impl Dataset {
             .transpose()?;
 
         let mut builder = CommitBuilder::new(dest.as_dest())
-            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
+            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20));
 
@@ -2308,7 +2308,7 @@ impl Dataset {
             .transpose()?;
 
         let mut builder = CommitBuilder::new(dest.as_dest())
-            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
+            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20));
 

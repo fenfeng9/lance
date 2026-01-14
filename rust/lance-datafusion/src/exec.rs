@@ -756,7 +756,7 @@ pub trait SessionContextExt {
     ) -> datafusion::common::Result<DataFrame>;
 }
 
-struct OneShotPartitionStream {
+pub struct OneShotPartitionStream {
     data: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: Arc<ArrowSchema>,
 }
@@ -772,7 +772,7 @@ impl std::fmt::Debug for OneShotPartitionStream {
 }
 
 impl OneShotPartitionStream {
-    fn new(data: SendableRecordBatchStream) -> Self {
+    pub fn new(data: SendableRecordBatchStream) -> Self {
         let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),

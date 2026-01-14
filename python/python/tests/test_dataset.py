@@ -428,6 +428,13 @@ def test_v2_manifest_paths(tmp_path: Path):
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
+def test_default_v2_manifest_paths(tmp_path: Path):
+    lance.write_dataset(pa.table({"a": range(100)}), tmp_path)
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
 def test_v2_manifest_paths_migration(tmp_path: Path):
     # Create a dataset with v1 manifest paths
     lance.write_dataset(
@@ -4042,7 +4049,7 @@ def test_default_storage_version(tmp_path: Path):
 
 def test_no_detached_v1(tmp_path: Path):
     table = pa.table({"x": [0]})
-    dataset = lance.write_dataset(table, tmp_path)
+    dataset = lance.write_dataset(table, tmp_path, enable_v2_manifest_paths=False)
 
     # Make a detached append
     table = pa.table({"x": [1]})

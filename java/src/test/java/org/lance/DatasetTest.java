@@ -1142,7 +1142,7 @@ public class DatasetTest {
         FragmentMetadata fragment = suite.createNewFragment(5);
         Append append = Append.builder().fragments(Collections.singletonList(fragment)).build();
         Transaction transaction = base.newTransactionBuilder().operation(append).build();
-        try (Dataset committed = base.commitTransaction(transaction, true)) {
+        try (Dataset committed = base.commitTransaction(transaction, true, false)) {
           // Original dataset is not refreshed to the new version.
           assertEquals(baseVersion, base.version());
           assertEquals(baseRowCount, base.countRows());
@@ -1174,7 +1174,7 @@ public class DatasetTest {
         UnsupportedOperationException ex =
             assertThrows(
                 UnsupportedOperationException.class,
-                () -> dataset.commitTransaction(transaction, true));
+                () -> dataset.commitTransaction(transaction, true, false));
 
         // Error should indicate detached commits are not supported on v1 manifests.
         assertNotNull(ex.getMessage());
