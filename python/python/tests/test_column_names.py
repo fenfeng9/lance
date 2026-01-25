@@ -349,7 +349,6 @@ class TestSpecialCharacterColumnNames:
 
         indices = special_char_dataset.describe_indices()
         assert len(indices) == 1
-        # Field with special chars is returned in quoted format for SQL compatibility
         assert indices[0].field_names == ["user-id"]
         assert indices[0].name == "user-id_idx"
 
@@ -577,7 +576,6 @@ class TestNestedFieldColumnNames:
 
         indices = nested_special_char_dataset.describe_indices()
         assert len(indices) == 1
-        # Fields with special chars are returned in quoted format for SQL compatibility
         assert indices[0].field_names == ["user-id"]
         assert indices[0].name == "meta-data.user-id_idx"
 
@@ -602,7 +600,6 @@ class TestNestedFieldColumnNames:
 
         indices = nested_special_char_dataset.describe_indices()
         assert len(indices) == 1
-        # Field with special chars is returned in quoted format for SQL compatibility
         assert indices[0].field_names == ["row-id"]
 
         result = nested_special_char_dataset.to_table(filter="`row-id` = 50")
