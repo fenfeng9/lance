@@ -549,7 +549,7 @@ impl AnyQuery for LabelListQuery {
                 let offsets_buffer =
                     OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
                 let labels_list = ListArray::try_new(
-                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), true)),
                     offsets_buffer,
                     labels_arr,
                     None,
@@ -569,7 +569,7 @@ impl AnyQuery for LabelListQuery {
                 let offsets_buffer =
                     OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, labels_arr.len() as i32]));
                 let labels_list = ListArray::try_new(
-                    Arc::new(Field::new("item", labels_arr.data_type().clone(), false)),
+                    Arc::new(Field::new("item", labels_arr.data_type().clone(), true)),
                     offsets_buffer,
                     labels_arr,
                     None,
