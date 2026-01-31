@@ -2054,6 +2054,22 @@ def test_label_list_index_array_contains(tmp_path: Path):
     assert "ScalarIndexQuery" not in explain
 
 
+def test_label_list_index_explain_null_literals(tmp_path: Path):
+    tbl = pa.table({"labels": [["foo", None], ["foo"]]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    # explain_plan should not panic when list literals include NULLs.
+    for expr in [
+        "array_has_any(labels, [NULL])",
+        "array_has_all(labels, [NULL])",
+        "array_has_any(labels, ['foo', NULL])",
+        "array_has_all(labels, ['foo', NULL])",
+    ]:
+        explain = dataset.scanner(filter=expr).explain_plan()
+        assert isinstance(explain, str)
+
+
 def test_create_index_empty_dataset(tmp_path: Path):
     # Creating an index on an empty dataset is (currently) not terribly useful but
     # we shouldn't return strange errors.
