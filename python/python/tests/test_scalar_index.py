@@ -2063,6 +2063,9 @@ def test_label_list_index_null_element_match(tmp_path: Path):
         "array_has_any(labels, ['foo'])",
         "array_has_all(labels, ['foo'])",
         "array_contains(labels, 'foo')",
+        "NOT array_has_any(labels, ['foo'])",
+        "NOT array_has_all(labels, ['foo'])",
+        "NOT array_contains(labels, 'foo')",
     ]
     expected = {
         f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
