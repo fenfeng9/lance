@@ -546,12 +546,7 @@ impl ScalarIndex for BitmapIndex {
             }
         };
 
-        let mut null_rows = null_row_ids.unwrap_or_default();
-        if !null_rows.is_empty() {
-            // A row can be both TRUE and NULL after list flattening; treat it as TRUE.
-            null_rows -= &row_ids;
-        }
-        let selection = NullableRowAddrSet::new(row_ids, null_rows);
+        let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
         Ok(SearchResult::Exact(selection))
     }
 
