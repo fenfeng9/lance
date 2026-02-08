@@ -2054,6 +2054,25 @@ def test_label_list_index_array_contains(tmp_path: Path):
     assert "ScalarIndexQuery" not in explain
 
 
+def test_label_list_index_empty_list_filters(tmp_path: Path):
+    """Empty list filters should not panic and should match pre-index results."""
+    tbl = pa.table({"labels": [["foo"], ["bar"], ["foo", None], [None], [], None]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, [])",
+        "array_has_all(labels, [])",
+        "NOT array_has_all(labels, [])",
+        "NOT array_has_any(labels, [])",
+    ]
+    expected = {f: dataset.to_table(filter=f).num_rows for f in filters}
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    for f in filters:
+        assert dataset.to_table(filter=f).num_rows == expected[f]
+
+
 def test_create_index_empty_dataset(tmp_path: Path):
     # Creating an index on an empty dataset is (currently) not terribly useful but
     # we shouldn't return strange errors.
