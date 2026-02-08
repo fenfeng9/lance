@@ -271,7 +271,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (Int64(_), _) => panic!("Attempt to compare Int16 with non-Int64"),
+            (Int64(_), _) => panic!("Attempt to compare Int64 with non-Int64"),
             (UInt8(v1), UInt8(v2)) => v1.cmp(v2),
             (UInt8(v1), Null) => {
                 if v1.is_none() {
@@ -307,7 +307,7 @@ impl Ord for OrderableScalarValue {
                     Ordering::Greater
                 }
             }
-            (UInt64(_), _) => panic!("Attempt to compare Int16 with non-UInt64"),
+            (UInt64(_), _) => panic!("Attempt to compare UInt64 with non-UInt64"),
             (Utf8(v1) | Utf8View(v1) | LargeUtf8(v1), Utf8(v2) | Utf8View(v2) | LargeUtf8(v2)) => {
                 v1.cmp(v2)
             }
