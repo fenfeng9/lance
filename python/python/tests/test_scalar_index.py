@@ -2010,6 +2010,23 @@ def test_scalar_index_with_nulls(tmp_path):
     assert len(result) == k
 
 
+def test_scalar_index_or_with_nulls_matches_scan(tmp_path: Path):
+    data = pa.table({"c1": pa.array([None, 1], type=pa.int64())})
+    filters = [
+        "(c1 != 0) OR (c1 < 5)",
+        "NOT ((c1 != 0) OR (c1 < 5))",
+    ]
+
+    ds_no = lance.write_dataset(data, tmp_path / "no")
+    expected = {f: ds_no.to_table(filter=f).num_rows for f in filters}
+
+    for idx_type in ["BITMAP", "BTREE"]:
+        ds = lance.write_dataset(data, tmp_path / idx_type.lower())
+        ds.create_scalar_index("c1", index_type=idx_type)
+        for f in filters:
+            assert ds.to_table(filter=f).num_rows == expected[f]
+
+
 def test_label_list_index(tmp_path: Path):
     tags = pa.array(["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"])
     tag_list = pa.ListArray.from_arrays([0, 2, 4], tags)

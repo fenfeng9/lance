@@ -237,14 +237,18 @@ impl std::ops::BitOr for NullableRowAddrMask {
             }
             (Self::AllowList(allow), Self::BlockList(block))
             | (Self::BlockList(block), Self::AllowList(allow)) => {
+                let allow_true = allow.selected.clone() - &allow.nulls;
+                let block_false = block.selected.clone() - &block.nulls;
+
                 let nulls = if allow.nulls.is_empty() && block.nulls.is_empty() {
                     RowAddrTreeMap::new() // Fast path
                 } else {
-                    // null or null -> null (excluding rows that are true in either)
-                    let allow_true = allow.selected.clone() - &allow.nulls;
-                    ((allow.nulls | block.nulls) & block.selected.clone()) - allow_true
+                    // NULL if (allow NULL and block FALSE) or (block NULL and allow not TRUE)
+                    (allow.nulls.clone() & &block_false) | (block.nulls - &allow_true)
                 };
-                let selected = (block.selected - allow.selected) | &nulls;
+                // Remaining FALSE rows after OR (block FALSE minus allow TRUE/NULL)
+                let false_rows = block_false - &allow_true - &allow.nulls;
+                let selected = false_rows | &nulls;
                 Self::BlockList(NullableRowAddrSet { selected, nulls })
             }
             (Self::BlockList(a), Self::BlockList(b)) => {
@@ -361,6 +365,30 @@ mod tests {
 
         // Row 0: FALSE in both; Rows 1,2,3: NULL in at least one
         assert_mask_selects(&result, &[], &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_or_allow_block_keeps_block_nulls() {
+        // Allow|Block OR must preserve NULLs from block even when block.selected is empty.
+        // allow: TRUE=[1], NULL=[0]; block: FALSE=[], NULL=[0]
+        let allow_mask = allow(&[1], &[0]);
+        let block_mask = block(&[], &[0]);
+        let result = allow_mask | block_mask;
+
+        // Row 1 is TRUE; row 0 remains NULL (not selected)
+        assert_mask_selects(&result, &[1], &[0]);
+    }
+
+    #[test]
+    fn test_or_allow_block_keeps_block_nulls_with_false_rows() {
+        // Ensure FALSE stays FALSE and NULL stays NULL when both appear on the block side.
+        // allow: TRUE=[2], NULL=[]; block: FALSE=[1], NULL=[0]
+        let allow_mask = allow(&[2], &[]);
+        let block_mask = block(&[1], &[0]);
+        let result = allow_mask | block_mask;
+
+        // Row 2 is TRUE; row 1 is FALSE; row 0 remains NULL (not selected)
+        assert_mask_selects(&result, &[2], &[0, 1]);
     }
 
     #[test]
