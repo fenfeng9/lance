@@ -94,7 +94,7 @@ use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEnt
 use self::write::write_fragments_internal;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
-use crate::dataset::refs::{BranchContents, Branches, Tags};
+use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
 use crate::index::retain_supported_indices;
@@ -481,7 +481,7 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
-        let branch_location = self.find_branch_location(branch)?;
+        let branch_location = self.branch_location().find_branch(Some(branch))?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: source_branch.clone(),
@@ -952,13 +952,11 @@ impl Dataset {
         }
     }
 
-    pub fn find_branch_location(&self, branch_name: &str) -> Result<BranchLocation> {
-        let current_location = BranchLocation {
-            path: self.base.clone(),
-            uri: self.uri.clone(),
-            branch: self.manifest.branch.clone(),
-        };
-        current_location.find_branch(Some(branch_name))
+    pub async fn branch_identifier(&self) -> Result<BranchIdentifier> {
+        self.refs
+            .branches()
+            .get_identifier(self.manifest.branch.as_deref())
+            .await
     }
 
     /// Get the full manifest of the dataset version.
