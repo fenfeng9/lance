@@ -243,12 +243,9 @@ impl std::ops::BitOr for NullableRowAddrMask {
                 let nulls = if allow.nulls.is_empty() && block.nulls.is_empty() {
                     RowAddrTreeMap::new() // Fast path
                 } else {
-                    // NULL if (allow NULL and block FALSE) or (block NULL and allow not TRUE)
                     (allow.nulls.clone() & &block_false) | (block.nulls - &allow_true)
                 };
-                // Remaining FALSE rows after OR (block FALSE minus allow TRUE/NULL)
-                let false_rows = block_false - &allow_true - &allow.nulls;
-                let selected = false_rows | &nulls;
+                let selected = (block_false - &allow_true) | &nulls;
                 Self::BlockList(NullableRowAddrSet { selected, nulls })
             }
             (Self::BlockList(a), Self::BlockList(b)) => {
