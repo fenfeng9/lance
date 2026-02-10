@@ -2071,6 +2071,8 @@ def test_label_list_index_empty_list_filters(tmp_path: Path):
 
     for f in filters:
         assert dataset.to_table(filter=f).num_rows == expected[f]
+
+
 def test_label_list_index_null_element_match(tmp_path: Path):
     """Covers NULL elements inside non-NULL lists (list itself is never NULL)."""
     tbl = pa.table(
