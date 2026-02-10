@@ -2071,6 +2071,100 @@ def test_label_list_index_empty_list_filters(tmp_path: Path):
 
     for f in filters:
         assert dataset.to_table(filter=f).num_rows == expected[f]
+def test_label_list_index_null_element_match(tmp_path: Path):
+    """Covers NULL elements inside non-NULL lists (list itself is never NULL)."""
+    tbl = pa.table(
+        {"labels": [["foo", None], ["foo"], ["bar", None], [None], ["bar"], []]}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, ['foo'])",
+        "array_has_all(labels, ['foo'])",
+        "array_contains(labels, 'foo')",
+        "NOT array_has_any(labels, ['foo'])",
+        "NOT array_has_all(labels, ['foo'])",
+        "NOT array_contains(labels, 'foo')",
+    ]
+    expected = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    actual = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+    assert actual == expected
+
+
+def test_label_list_index_null_list_match(tmp_path: Path):
+    """Covers NULL lists (list itself is NULL, elements are not NULL)."""
+    tbl = pa.table({"labels": [["foo"], ["bar"], None, []]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, ['foo'])",
+        "array_has_all(labels, ['foo'])",
+        "array_contains(labels, 'foo')",
+        # TODO(issue #5904): Enable after fixing NOT filters with whole-list NULLs
+        # "NOT array_has_any(labels, ['foo'])",
+        # "NOT array_has_all(labels, ['foo'])",
+        # "NOT array_contains(labels, 'foo')",
+    ]
+    expected = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    actual = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+    assert actual == expected
+
+
+def test_label_list_index_null_literal_filters(tmp_path: Path):
+    """Ensure filters with NULL literal needles produce consistent results with scan."""
+    tbl = pa.table(
+        {"labels": [["foo", None], ["bar", None], [None], ["foo"], ["bar"], []]}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    filters = [
+        "array_has_any(labels, [NULL])",
+        "array_has_all(labels, [NULL])",
+        "array_contains(labels, NULL)",
+        "NOT array_has_any(labels, [NULL])",
+        "NOT array_has_all(labels, [NULL])",
+        "NOT array_contains(labels, NULL)",
+    ]
+    expected = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    actual = {
+        f: dataset.to_table(filter=f).column("labels").to_pylist() for f in filters
+    }
+    assert actual == expected
+
+
+def test_label_list_index_explain_null_literals(tmp_path: Path):
+    tbl = pa.table({"labels": [["foo", None], ["foo"]]})
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    # explain_plan should not panic when list literals include NULLs.
+    for expr in [
+        "array_has_any(labels, [NULL])",
+        "array_has_all(labels, [NULL])",
+        "array_has_any(labels, ['foo', NULL])",
+        "array_has_all(labels, ['foo', NULL])",
+    ]:
+        explain = dataset.scanner(filter=expr).explain_plan()
+        assert isinstance(explain, str)
 
 
 def test_create_index_empty_dataset(tmp_path: Path):
