@@ -251,15 +251,17 @@ impl std::ops::BitOr for NullableRowAddrMask {
                 Self::BlockList(NullableRowAddrSet { selected, nulls })
             }
             (Self::BlockList(a), Self::BlockList(b)) => {
+                let a_false = a.selected.clone() - &a.nulls;
+                let b_false = b.selected.clone() - &b.nulls;
                 let nulls = if a.nulls.is_empty() && b.nulls.is_empty() {
                     RowAddrTreeMap::new() // Fast path
                 } else {
-                    // null or null -> null (excluding rows that are true in either)
-                    let false_rows =
-                        (a.selected.clone() - &a.nulls) & (b.selected.clone() - &b.nulls);
-                    (a.nulls | &b.nulls) - false_rows
+                    // NULL if: (A NULL & B FALSE) or (A FALSE & B NULL) or (A NULL & B NULL).
+                    (a.nulls.clone() & &b_false)
+                        | (b.nulls.clone() & &a_false)
+                        | (a.nulls & &b.nulls)
                 };
-                let selected = (a.selected & b.selected) | &nulls;
+                let selected = (a_false & b_false) | &nulls;
                 Self::BlockList(NullableRowAddrSet { selected, nulls })
             }
         }
@@ -388,6 +390,17 @@ mod tests {
 
         // Row 2 is TRUE; row 1 is FALSE; row 0 remains NULL (not selected)
         assert_mask_selects(&result, &[2], &[0, 1]);
+    }
+
+    #[test]
+    fn test_or_block_block_true_overrides_null() {
+        // TRUE OR NULL should be TRUE, even when both sides are BlockList.
+        let true_mask = block(&[], &[]);
+        let null_mask = block(&[], &[0]);
+        let result = true_mask | null_mask;
+
+        // Row 0 should be TRUE.
+        assert_mask_selects(&result, &[0], &[]);
     }
 
     #[test]
