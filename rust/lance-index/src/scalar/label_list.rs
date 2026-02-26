@@ -15,10 +15,11 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
-use datafusion_common::{DataFusionError, ScalarValue};
+use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
 use lance_core::cache::LanceCache;
+use lance_core::error::LanceOptionExt;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result, ROW_ID};
 use roaring::RoaringBitmap;
@@ -324,16 +325,9 @@ fn record_list_nulls(
     batch: &RecordBatch,
     list_nulls: &Arc<Mutex<RowAddrTreeMap>>,
 ) -> datafusion_common::Result<()> {
-    let values = batch.column_by_name(VALUE_COLUMN_NAME).ok_or_else(|| {
-        DataFusionError::Internal("Index training data missing value column".to_string())
-    })?;
-    let row_ids = batch.column_by_name(ROW_ID).ok_or_else(|| {
-        DataFusionError::Internal("Index training data missing row id column".to_string())
-    })?;
-    let row_ids = row_ids
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| DataFusionError::Internal("Row id column must be UInt64".to_string()))?;
+    let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
+    let row_ids = batch.column_by_name(ROW_ID).expect_ok()?;
+    let row_ids = row_ids.as_any().downcast_ref::<UInt64Array>().unwrap();
 
     let mut local_nulls = RowAddrTreeMap::new();
     for i in 0..values.len() {
