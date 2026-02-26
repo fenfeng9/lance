@@ -27,6 +27,7 @@ use lance_index::pbold::{
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::inverted::METADATA_FILE;
+use lance_index::scalar::label_list::LABEL_LIST_NULLS_MIN_VERSION;
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
@@ -333,6 +334,18 @@ pub async fn open_scalar_index(
 
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
+    if index_details.type_url.ends_with("LabelListIndexDetails")
+        && index.index_version < LABEL_LIST_NULLS_MIN_VERSION
+    {
+        if let Some(field) = dataset.schema().field(column) {
+            if field.nullable {
+                log::warn!(
+                    "LabelList index {} is old; NOT filters may be incorrect on nullable lists. Consider rebuilding.",
+                    index.name
+                );
+            }
+        }
+    }
 
     let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
 

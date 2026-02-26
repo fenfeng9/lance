@@ -42,6 +42,7 @@ use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 const LABEL_LIST_NULLS_NAME: &str = "label_list_nulls.lance";
+pub const LABEL_LIST_NULLS_MIN_VERSION: i32 = 1;
 const LABEL_LIST_INDEX_VERSION: u32 = 1;
 
 static LABEL_LIST_NULLS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -445,13 +446,21 @@ async fn read_list_nulls(
 ) -> Result<RowAddrTreeMap> {
     let reader = match store.open_index_file(LABEL_LIST_NULLS_NAME).await {
         Ok(reader) => reader,
-        Err(Error::NotFound { .. }) => {
-            log::warn!(
-                "LabelList index missing list-level NULLs file; NOT filters on nullable lists may be incorrect. Consider rebuilding the index."
+        Err(err) => {
+            // Old LabelList indices don't have label_list_nulls.lance; treat as empty for compatibility.
+            let is_not_found = matches!(
+                &err,
+                Error::IO { source, .. }
+                    if source
+                        .downcast_ref::<object_store::Error>()
+                        .map(|err| matches!(err, object_store::Error::NotFound { .. }))
+                        .unwrap_or(false)
             );
-            return Ok(RowAddrTreeMap::default());
+            if is_not_found {
+                return Ok(RowAddrTreeMap::default());
+            }
+            return Err(err);
         }
-        Err(err) => return Err(err),
     };
 
     let batch = reader.read_range(0..1, None).await?;
