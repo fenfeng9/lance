@@ -41,7 +41,7 @@ use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
-const LABEL_LIST_NULLS_NAME: &str = "label_list_nulls.lance";
+pub const LABEL_LIST_NULLS_NAME: &str = "label_list_nulls.lance";
 pub const LABEL_LIST_NULLS_MIN_VERSION: i32 = 1;
 const LABEL_LIST_INDEX_VERSION: u32 = 1;
 

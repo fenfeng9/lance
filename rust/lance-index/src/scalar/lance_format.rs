@@ -307,7 +307,7 @@ pub mod tests {
     use crate::pbold;
     use crate::scalar::bitmap::BitmapIndexPlugin;
     use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
-    use crate::scalar::label_list::LabelListIndexPlugin;
+    use crate::scalar::label_list::{LabelListIndexPlugin, LABEL_LIST_NULLS_NAME};
     use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
         bitmap::BitmapIndex,
@@ -1594,6 +1594,70 @@ pub mod tests {
                     row_ids.null_rows().is_empty(),
                     "null_row_ids should be empty when null elements are ignored"
                 );
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_label_list_missing_nulls_file_is_compatible() {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+
+        let list_array = ListArray::from_iter_primitive::<UInt8Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            None,
+            Some(vec![Some(2)]),
+        ]);
+        let row_ids = UInt64Array::from_iter_values(0..3);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                VALUE_COLUMN_NAME,
+                DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+                true,
+            ),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(list_array), Arc::new(row_ids)],
+        )
+        .unwrap();
+
+        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        train_tag(&index_store, batch_reader).await;
+
+        index_store
+            .delete_index_file(LABEL_LIST_NULLS_NAME)
+            .await
+            .unwrap();
+
+        let index = LabelListIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::LabelListIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                assert!(
+                    row_ids.null_rows().is_empty(),
+                    "missing nulls file should default to empty null rows"
+                );
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![0]);
             }
             _ => panic!("Expected Exact search result"),
         }
