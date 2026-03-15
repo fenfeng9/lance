@@ -7,6 +7,7 @@ use super::{IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{Error, Result, cache::LanceCache};
@@ -22,6 +23,7 @@ use lance_io::utils::CachedFileSize;
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
+use snafu::location;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
@@ -75,6 +77,13 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
         Ok(offset as u64)
     }
 
+    async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
+        Err(Error::not_supported(
+            "legacy scalar index writer does not support global buffers",
+            location!(),
+        ))
+    }
+
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
@@ -94,6 +103,10 @@ impl IndexWriter for current_writer::FileWriter {
         Ok(offset)
     }
 
+    async fn add_global_buffer(&mut self, data: Bytes) -> Result<u32> {
+        Self::add_global_buffer(self, data).await
+    }
+
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
@@ -111,6 +124,13 @@ impl IndexReader for PreviousFileReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
+    }
+
+    async fn read_global_buffer(&self, _n: u32) -> Result<Bytes> {
+        Err(Error::not_supported(
+            "legacy scalar index reader does not support global buffers",
+            location!(),
+        ))
     }
 
     async fn read_range(
@@ -145,6 +165,10 @@ impl IndexReader for current_reader::FileReader {
         let end = start + batch_size;
         let end = end.min(self.num_rows());
         self.read_range(start as usize..end as usize, None).await
+    }
+
+    async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
+        Self::read_global_buffer(self, n).await
     }
 
     async fn read_range(
@@ -325,6 +349,7 @@ pub mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
+    use bytes::Bytes;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
@@ -378,6 +403,28 @@ pub mod tests {
     fn default_details<T: prost::Message + prost::Name + std::default::Default>() -> prost_types::Any
     {
         prost_types::Any::from_msg(&T::default()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_global_buffer_round_trip() {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+
+        let mut writer = index_store
+            .new_index_file("global-buffer.lance", Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        let expected = Bytes::from_static(b"scalar-global-buffer");
+        let buffer_idx = writer.add_global_buffer(expected.clone()).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let reader = index_store
+            .open_index_file("global-buffer.lance")
+            .await
+            .unwrap();
+        let actual = reader.read_global_buffer(buffer_idx).await.unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

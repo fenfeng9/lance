@@ -7,6 +7,7 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -172,6 +173,8 @@ pub trait IndexWriter: Send {
     ///
     /// E.g. if this is the third time this is called this method will return 2
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
+    /// Adds a global buffer and returns its index.
+    async fn add_global_buffer(&mut self, data: Bytes) -> Result<u32>;
     /// Finishes writing the file and closes the file
     async fn finish(&mut self) -> Result<()>;
     /// Finishes writing the file and closes the file with additional metadata
@@ -183,6 +186,8 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
+    /// Reads a global buffer by index.
+    async fn read_global_buffer(&self, index: u32) -> Result<Bytes>;
     /// Read the range of rows from the file.
     /// If projection is Some, only return the columns in the projection,
     /// nested columns like Some(&["x.y"]) are not supported.

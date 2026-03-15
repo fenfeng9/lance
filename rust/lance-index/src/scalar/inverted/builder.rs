@@ -1488,6 +1488,7 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::ROW_ID;
@@ -1540,6 +1541,13 @@ mod tests {
     impl IndexWriter for CountingWriter {
         async fn write_record_batch(&mut self, _batch: RecordBatch) -> Result<u64> {
             Ok(self.write_count.fetch_add(1, Ordering::SeqCst) as u64)
+        }
+
+        async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
+            Err(Error::not_supported(
+                "counting writer does not support global buffers",
+                location!(),
+            ))
         }
 
         async fn finish(&mut self) -> Result<()> {
