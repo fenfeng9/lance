@@ -29,7 +29,6 @@ use arrow_arith::numeric::add;
 use arrow_array::{Array, RecordBatch, UInt32Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
@@ -921,12 +920,6 @@ impl IndexReader for LazyRangedIndexReader {
         reader
             .read_record_batch(local_page_idx as u64, batch_size)
             .await
-    }
-
-    async fn read_global_buffer(&self, _n: u32) -> Result<Bytes> {
-        Err(Error::not_supported(
-            "lazy ranged index reader does not support global buffers",
-        ))
     }
 
     async fn read_range(

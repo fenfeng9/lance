@@ -23,7 +23,6 @@ use lance_io::utils::CachedFileSize;
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
-use snafu::location;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
@@ -80,7 +79,6 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
     async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
         Err(Error::not_supported(
             "legacy scalar index writer does not support global buffers",
-            location!(),
         ))
     }
 
@@ -129,7 +127,6 @@ impl IndexReader for PreviousFileReader {
     async fn read_global_buffer(&self, _n: u32) -> Result<Bytes> {
         Err(Error::not_supported(
             "legacy scalar index reader does not support global buffers",
-            location!(),
         ))
     }
 
@@ -331,7 +328,7 @@ pub mod tests {
     use crate::pbold;
     use crate::scalar::bitmap::BitmapIndexPlugin;
     use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
-    use crate::scalar::label_list::{LABEL_LIST_NULLS_NAME, LabelListIndexPlugin};
+    use crate::scalar::label_list::LabelListIndexPlugin;
     use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
         LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
@@ -349,7 +346,6 @@ pub mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
-    use bytes::Bytes;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
@@ -403,28 +399,6 @@ pub mod tests {
     fn default_details<T: prost::Message + prost::Name + std::default::Default>() -> prost_types::Any
     {
         prost_types::Any::from_msg(&T::default()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_global_buffer_round_trip() {
-        let tempdir = TempDir::default();
-        let index_store = test_store(&tempdir);
-
-        let mut writer = index_store
-            .new_index_file("global-buffer.lance", Arc::new(Schema::empty()))
-            .await
-            .unwrap();
-        let expected = Bytes::from_static(b"scalar-global-buffer");
-        let buffer_idx = writer.add_global_buffer(expected.clone()).await.unwrap();
-        writer.finish().await.unwrap();
-
-        let reader = index_store
-            .open_index_file("global-buffer.lance")
-            .await
-            .unwrap();
-        let actual = reader.read_global_buffer(buffer_idx).await.unwrap();
-
-        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -1492,7 +1466,6 @@ pub mod tests {
 
         let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
 
-        // This is probably enough data that we can be assured each tag is used at least once
         train_tag(&index_store, batch_reader).await;
 
         // We scan through each list, if it was a match we run match_fn to check
@@ -1580,21 +1553,18 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_label_list_null_handling() {
+    async fn test_label_list_ignores_null_elements() {
         let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
 
-        // Create test data with null items within lists:
-        // Row 0: [1, 2] - no nulls
-        // Row 1: [3, null] - has a null item
-        // Row 2: [4] - no nulls
+        // Null elements inside a non-null list should be ignored by the index;
+        // they should not turn the row into a NULL match result.
         let list_array = ListArray::from_iter_primitive::<UInt8Type, _, _>(vec![
             Some(vec![Some(1), Some(2)]),
             Some(vec![Some(3), None]),
             Some(vec![Some(4)]),
         ]);
         let row_ids = UInt64Array::from_iter_values(0..3);
-        // Create schema with nullable list items to match the ListArray
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 VALUE_COLUMN_NAME,
@@ -1622,10 +1592,8 @@ pub mod tests {
             .await
             .unwrap();
 
-        // Test: Search for lists containing value 1
-        // Row 0: [1, 2] - contains 1 → TRUE
-        // Row 1: [3, null] - null elements are ignored → FALSE
-        // Row 2: [4] - doesn't contain 1 → FALSE
+        // Search for a value present only in the first row. Rows with null
+        // elements should behave the same as rows with other non-matching values.
         let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
@@ -1653,37 +1621,29 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_label_list_missing_nulls_file_is_compatible() {
+    async fn test_label_list_bitmap_only_layout_is_compatible() {
         let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
 
-        let list_array = ListArray::from_iter_primitive::<UInt8Type, _, _>(vec![
-            Some(vec![Some(1)]),
-            None,
-            Some(vec![Some(2)]),
-        ]);
-        let row_ids = UInt64Array::from_iter_values(0..3);
+        // Simulate an older released layout that only had the bitmap lookup file.
+        let values = arrow_array::UInt8Array::from(vec![1, 2]);
+        let row_ids = UInt64Array::from(vec![0, 2]);
         let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                VALUE_COLUMN_NAME,
-                DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
-                true,
-            ),
+            Field::new(VALUE_COLUMN_NAME, DataType::UInt8, true),
             Field::new(ROW_ID, DataType::UInt64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(list_array), Arc::new(row_ids)],
-        )
-        .unwrap();
-
-        let batch_reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        train_tag(&index_store, batch_reader).await;
-
-        index_store
-            .delete_index_file(LABEL_LIST_NULLS_NAME)
-            .await
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
             .unwrap();
+
+        BitmapIndexPlugin::train_bitmap_index(
+            lance_datafusion::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)],
+                schema,
+            ))),
+            index_store.as_ref(),
+        )
+        .await
+        .unwrap();
 
         let index = LabelListIndexPlugin
             .load_index(
@@ -1700,10 +1660,7 @@ pub mod tests {
 
         match result {
             SearchResult::Exact(row_ids) => {
-                assert!(
-                    row_ids.null_rows().is_empty(),
-                    "missing nulls file should default to empty null rows"
-                );
+                assert!(row_ids.null_rows().is_empty());
                 let actual_rows: Vec<u64> = row_ids
                     .true_rows()
                     .row_addrs()
