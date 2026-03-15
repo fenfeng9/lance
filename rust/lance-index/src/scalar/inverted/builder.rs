@@ -1546,7 +1546,6 @@ mod tests {
         async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
             Err(Error::not_supported(
                 "counting writer does not support global buffers",
-                location!(),
             ))
         }
 

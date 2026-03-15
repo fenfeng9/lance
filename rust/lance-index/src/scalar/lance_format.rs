@@ -331,7 +331,7 @@ pub mod tests {
     use crate::pbold;
     use crate::scalar::bitmap::BitmapIndexPlugin;
     use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
-    use crate::scalar::label_list::{LabelListIndexPlugin, LABEL_LIST_NULLS_NAME};
+    use crate::scalar::label_list::{LABEL_LIST_NULLS_NAME, LabelListIndexPlugin};
     use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
         LabelListQuery, SargableQuery, ScalarIndex, SearchResult,

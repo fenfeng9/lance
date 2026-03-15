@@ -926,7 +926,6 @@ impl IndexReader for LazyRangedIndexReader {
     async fn read_global_buffer(&self, _n: u32) -> Result<Bytes> {
         Err(Error::not_supported(
             "lazy ranged index reader does not support global buffers",
-            location!(),
         ))
     }
 

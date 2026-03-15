@@ -14,14 +14,14 @@ use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::RecordBatchStream;
-use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_core::cache::LanceCache;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, ROW_ID, Result};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
