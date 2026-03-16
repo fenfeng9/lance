@@ -402,6 +402,28 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_global_buffer_round_trip() {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+
+        let mut writer = index_store
+            .new_index_file("global-buffer.lance", Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        let expected = bytes::Bytes::from_static(b"scalar-global-buffer");
+        let buffer_idx = writer.add_global_buffer(expected.clone()).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let reader = index_store
+            .open_index_file("global-buffer.lance")
+            .await
+            .unwrap();
+        let actual = reader.read_global_buffer(buffer_idx).await.unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn test_basic_btree() {
         let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
@@ -1466,6 +1488,7 @@ pub mod tests {
 
         let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
 
+        // This is probably enough data that we can be assured each tag is used at least once
         train_tag(&index_store, batch_reader).await;
 
         // We scan through each list, if it was a match we run match_fn to check
@@ -1553,18 +1576,21 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_label_list_ignores_null_elements() {
+    async fn test_label_list_null_handling() {
         let tempdir = TempDir::default();
         let index_store = test_store(&tempdir);
 
-        // Null elements inside a non-null list should be ignored by the index;
-        // they should not turn the row into a NULL match result.
+        // Create test data with null items within lists:
+        // Row 0: [1, 2] - no nulls
+        // Row 1: [3, null] - has a null item
+        // Row 2: [4] - no nulls
         let list_array = ListArray::from_iter_primitive::<UInt8Type, _, _>(vec![
             Some(vec![Some(1), Some(2)]),
             Some(vec![Some(3), None]),
             Some(vec![Some(4)]),
         ]);
         let row_ids = UInt64Array::from_iter_values(0..3);
+        // Create schema with nullable list items to match the ListArray
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 VALUE_COLUMN_NAME,
@@ -1592,8 +1618,10 @@ pub mod tests {
             .await
             .unwrap();
 
-        // Search for a value present only in the first row. Rows with null
-        // elements should behave the same as rows with other non-matching values.
+        // Test: Search for lists containing value 1
+        // Row 0: [1, 2] - contains 1 → TRUE
+        // Row 1: [3, null] - null elements are ignored → FALSE
+        // Row 2: [4] - doesn't contain 1 → FALSE
         let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]);
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
 
