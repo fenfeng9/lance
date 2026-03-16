@@ -76,12 +76,6 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
         Ok(offset as u64)
     }
 
-    async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
-        Err(Error::not_supported(
-            "legacy scalar index writer does not support global buffers",
-        ))
-    }
-
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
@@ -122,12 +116,6 @@ impl IndexReader for PreviousFileReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
-    }
-
-    async fn read_global_buffer(&self, _n: u32) -> Result<Bytes> {
-        Err(Error::not_supported(
-            "legacy scalar index reader does not support global buffers",
-        ))
     }
 
     async fn read_range(
