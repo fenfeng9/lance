@@ -471,7 +471,7 @@ async fn write_label_list_bitmap_index(
     state: HashMap<ScalarValue, RowAddrTreeMap>,
     store: &dyn IndexStore,
     value_type: &DataType,
-    list_nulls: RowAddrTreeMap,
+    list_nulls: &RowAddrTreeMap,
 ) -> Result<()> {
     BitmapIndexPlugin::write_bitmap_index_with_extras(
         state,
