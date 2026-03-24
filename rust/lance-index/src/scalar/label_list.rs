@@ -231,7 +231,7 @@ impl ScalarIndex for LabelListIndex {
             remapped_state,
             dest_store,
             self.values_index.value_type(),
-            remapped_nulls,
+            &remapped_nulls,
         )
         .await?;
 
@@ -261,7 +261,7 @@ impl ScalarIndex for LabelListIndex {
         if !new_nulls.is_empty() {
             merged_nulls |= &new_nulls;
         }
-        write_label_list_bitmap_index(merged_state, dest_store, &value_type, merged_nulls).await?;
+        write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
@@ -482,7 +482,7 @@ async fn write_label_list_bitmap_index(
         HashMap::new(),
         vec![(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),
-            serialize_list_nulls(&list_nulls)?,
+            serialize_list_nulls(list_nulls)?,
         )],
     )
     .await
@@ -581,7 +581,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         let (state, value_type) =
             BitmapIndexPlugin::build_bitmap_index_state(data, HashMap::new()).await?;
         let list_nulls = list_nulls.lock().unwrap().clone();
-        write_label_list_bitmap_index(state, index_store, &value_type, list_nulls).await?;
+        write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
