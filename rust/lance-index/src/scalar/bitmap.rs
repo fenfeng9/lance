@@ -562,6 +562,11 @@ impl ScalarIndex for BitmapIndex {
                     "full text search is not supported for bitmap indexes".into(),
                 ));
             }
+            SargableQuery::LikePrefix(_) => {
+                return Err(Error::not_supported_source(
+                    "LIKE prefix queries are not supported for bitmap indexes".into(),
+                ));
+            }
         };
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
@@ -586,6 +591,7 @@ impl ScalarIndex for BitmapIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -603,6 +609,7 @@ impl ScalarIndex for BitmapIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -844,6 +851,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 

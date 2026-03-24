@@ -3,11 +3,23 @@
 
 from enum import Enum
 
-from lance.indices.builder import IndexConfig, IndicesBuilder
-from lance.indices.ivf import IvfModel
-from lance.indices.pq import PqModel
+from .. import lance as _lance
+from .builder import IndexConfig, IndicesBuilder
+from .ivf import IvfModel
+from .pq import PqModel
 
-__all__ = ["IndicesBuilder", "IndexConfig", "PqModel", "IvfModel", "IndexFileVersion"]
+IndexSegment = _lance.indices.IndexSegment
+IndexSegmentPlan = _lance.indices.IndexSegmentPlan
+
+__all__ = [
+    "IndicesBuilder",
+    "IndexConfig",
+    "PqModel",
+    "IvfModel",
+    "IndexFileVersion",
+    "IndexSegment",
+    "IndexSegmentPlan",
+]
 
 
 class IndexFileVersion(str, Enum):

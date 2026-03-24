@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::sync::Arc;
 
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
@@ -31,12 +32,12 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
-use crate::utils::PyJson;
+use crate::utils::{PyJson, PyLance};
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
-use lance_index::{DatasetIndexExt, IndexDescription};
+use lance_index::{DatasetIndexExt, IndexDescription, IndexSegment, IndexSegmentPlan, IndexType};
 use uuid::Uuid;
 
 #[pyclass(name = "IndexConfig", module = "lance.indices", get_all)]
@@ -54,6 +55,93 @@ impl PyIndexConfig {
             index_type: index_type.to_string(),
             config: config.to_string(),
         })
+    }
+}
+
+#[pyclass(name = "IndexSegment", module = "lance.indices")]
+#[derive(Debug, Clone)]
+pub struct PyIndexSegment {
+    pub(crate) inner: IndexSegment,
+}
+
+impl PyIndexSegment {
+    pub(crate) fn from_inner(inner: IndexSegment) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyIndexSegment {
+    #[getter]
+    fn uuid(&self) -> String {
+        self.inner.uuid().to_string()
+    }
+
+    #[getter]
+    fn fragment_ids(&self) -> HashSet<u32> {
+        self.inner.fragment_bitmap().iter().collect()
+    }
+
+    #[getter]
+    fn index_version(&self) -> i32 {
+        self.inner.index_version()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexSegment(uuid={}, fragment_ids={:?}, index_version={})",
+            self.uuid(),
+            self.fragment_ids(),
+            self.index_version()
+        )
+    }
+}
+
+#[pyclass(name = "IndexSegmentPlan", module = "lance.indices")]
+#[derive(Debug, Clone)]
+pub struct PyIndexSegmentPlan {
+    pub(crate) inner: IndexSegmentPlan,
+}
+
+impl PyIndexSegmentPlan {
+    pub(crate) fn from_inner(inner: IndexSegmentPlan) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PyIndexSegmentPlan {
+    #[getter]
+    fn staging_index_uuid(&self) -> String {
+        self.inner.staging_index_uuid().to_string()
+    }
+
+    #[getter]
+    fn segment(&self) -> PyIndexSegment {
+        PyIndexSegment::from_inner(self.inner.segment().clone())
+    }
+
+    #[getter]
+    fn partial_indices(&self) -> Vec<PyLance<lance_table::format::IndexMetadata>> {
+        self.inner
+            .partial_indices()
+            .iter()
+            .cloned()
+            .map(PyLance)
+            .collect()
+    }
+
+    #[getter]
+    fn estimated_bytes(&self) -> u64 {
+        self.inner.estimated_bytes()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "IndexSegmentPlan(staging_index_uuid={}, partial_indices={}, estimated_bytes={})",
+            self.staging_index_uuid(),
+            self.inner.partial_indices().len(),
+            self.estimated_bytes()
+        )
     }
 }
 
@@ -415,9 +503,21 @@ async fn do_load_shuffled_vectors(
     .infer_error()?;
 
     let mut ds = dataset.ds.as_ref().clone();
-    ds.commit_existing_index(index_name, column, index_id)
-        .await
-        .infer_error()?;
+    ds.commit_existing_index_segments(
+        index_name,
+        column,
+        vec![IndexSegment::new(
+            index_id,
+            ds.fragments().iter().map(|f| f.id as u32),
+            Arc::new(
+                prost_types::Any::from_msg(&lance_table::format::pb::VectorIndexDetails::default())
+                    .unwrap(),
+            ),
+            IndexType::IvfPq.version(),
+        )],
+    )
+    .await
+    .infer_error()?;
 
     Ok(())
 }
@@ -484,17 +584,21 @@ pub struct PyIndexSegmentDescription {
     pub index_version: i32,
     /// The timestamp when the index segment was created
     pub created_at: Option<DateTime<Utc>>,
+    /// The total size in bytes of all files in this segment
+    /// (None for backward compatibility with indices created before file tracking)
+    pub size_bytes: Option<u64>,
 }
 
 impl PyIndexSegmentDescription {
     pub fn __repr__(&self) -> String {
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
             self.fragment_ids,
             self.index_version,
-            self.created_at
+            self.created_at,
+            self.size_bytes
         )
     }
 }
@@ -517,6 +621,9 @@ pub struct PyIndexDescription {
     pub details: PyJson,
     /// The segments of the index
     pub segments: Vec<PyIndexSegmentDescription>,
+    /// The total size in bytes of all files across all segments
+    /// (None for backward compatibility with indices created before file tracking)
+    pub total_size_bytes: Option<u64>,
 }
 
 impl PyIndexDescription {
@@ -542,12 +649,14 @@ impl PyIndexDescription {
                     .as_ref()
                     .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
                     .unwrap_or_default();
+                let size_bytes = segment.total_size_bytes();
                 PyIndexSegmentDescription {
                     uuid: segment.uuid.to_string(),
                     dataset_version_at_last_update: segment.dataset_version,
                     fragment_ids,
                     index_version: segment.index_version,
                     created_at: segment.created_at,
+                    size_bytes,
                 }
             })
             .collect();
@@ -563,6 +672,7 @@ impl PyIndexDescription {
             type_url: index.type_url().to_string(),
             num_rows_indexed: index.rows_indexed(),
             details: PyJson(details),
+            total_size_bytes: index.total_size_bytes(),
         }
     }
 }
@@ -570,15 +680,20 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
-        format!(
-            "IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})",
+        let mut repr = format!(
+            "IndexDescription(name='{}', type_url='{}', num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={}",
             self.name,
             self.type_url,
             self.num_rows_indexed,
             self.fields,
             self.field_names,
             self.segments.len()
-        )
+        );
+        if let Some(byte_size) = self.total_size_bytes {
+            write!(repr, ", total_size_bytes={}", byte_size).unwrap();
+        }
+        repr.push(')');
+        repr
     }
 }
 
@@ -591,6 +706,8 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
     indices.add_class::<PyIvfModel>()?;
     indices.add_class::<PyIndexConfig>()?;
+    indices.add_class::<PyIndexSegment>()?;
+    indices.add_class::<PyIndexSegmentPlan>()?;
     indices.add_class::<PyIndexDescription>()?;
     indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;

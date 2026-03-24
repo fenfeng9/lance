@@ -47,7 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig, SupportedDistributedIndices
+from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
     CleanupStats,
     Compaction,
@@ -2785,6 +2785,376 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
+    def _create_index_impl(
+        self,
+        column: Union[str, List[str]],
+        index_type: str,
+        name: Optional[str] = None,
+        metric: str = "L2",
+        replace: bool = False,
+        num_partitions: Optional[int] = None,
+        ivf_centroids: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        pq_codebook: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        num_sub_vectors: Optional[int] = None,
+        accelerator: Optional[Union[str, "torch.Device"]] = None,
+        index_cache_size: Optional[int] = None,
+        shuffle_partition_batches: Optional[int] = None,
+        shuffle_partition_concurrency: Optional[int] = None,
+        ivf_centroids_file: Optional[str] = None,
+        precomputed_partition_dataset: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        filter_nan: bool = True,
+        train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        index_uuid: Optional[str] = None,
+        *,
+        target_partition_size: Optional[int] = None,
+        skip_transpose: bool = False,
+        require_commit: bool = True,
+        **kwargs,
+    ) -> Index:
+        if not require_commit and fragment_ids is None:
+            raise ValueError(
+                "create_index_uncommitted requires fragment_ids "
+                "for distributed index build"
+            )
+
+        # Only support building index for 1 column from the API aspect, however
+        # the internal implementation might support building multi-column index later.
+        if isinstance(column, str):
+            column = [column]
+
+        # validate args
+        for c in column:
+            lance_field = self._ds.lance_schema.field_case_insensitive(c)
+            if lance_field is None:
+                raise KeyError(f"{c} not found in schema")
+            field = lance_field.to_arrow()
+            is_multivec = False
+            if pa.types.is_fixed_size_list(field.type):
+                dimension = field.type.list_size
+            elif pa.types.is_list(field.type) and pa.types.is_fixed_size_list(
+                field.type.value_type
+            ):
+                dimension = field.type.value_type.list_size
+                is_multivec = True
+            elif (
+                isinstance(field.type, pa.FixedShapeTensorType)
+                and len(field.type.shape) == 1
+            ):
+                dimension = field.type.shape[0]
+            else:
+                raise TypeError(
+                    f"Vector column {c} must be FixedSizeListArray "
+                    f"1-dimensional FixedShapeTensorArray, got {field.type}"
+                )
+
+            if num_sub_vectors is not None and dimension % num_sub_vectors != 0:
+                raise ValueError(
+                    f"dimension ({dimension}) must be divisible by num_sub_vectors"
+                    f" ({num_sub_vectors})"
+                )
+
+            element_type = field.type.value_type
+            if is_multivec:
+                element_type = field.type.value_type.value_type
+            if not (
+                pa.types.is_floating(element_type) or pa.types.is_uint8(element_type)
+            ):
+                raise TypeError(
+                    f"Vector column {c} must have floating value type, "
+                    f"got {field.type.value_type}"
+                )
+
+        if not isinstance(metric, str) or metric.lower() not in [
+            "l2",
+            "cosine",
+            "euclidean",
+            "dot",
+            "hamming",
+        ]:
+            raise ValueError(f"Metric {metric} not supported.")
+
+        kwargs["metric_type"] = metric
+
+        index_type = index_type.upper()
+        valid_index_types = [
+            "IVF_FLAT",
+            "IVF_PQ",
+            "IVF_SQ",
+            "IVF_HNSW_FLAT",
+            "IVF_HNSW_PQ",
+            "IVF_HNSW_SQ",
+            "IVF_RQ",
+        ]
+        if index_type not in valid_index_types:
+            raise NotImplementedError(
+                f"Only {valid_index_types} index types supported. Got {index_type}"
+            )
+
+        # Handle timing for various parts of accelerated builds
+        timers = {}
+        if accelerator is not None and index_type != "IVF_PQ":
+            LOGGER.warning(
+                "Index type %s does not support GPU acceleration; falling back to CPU",
+                index_type,
+            )
+            accelerator = None
+
+        # IMPORTANT: Distributed indexing is CPU-only. Enforce single-node when
+        # accelerator or torch-related paths are detected.
+        torch_detected = False
+        try:
+            if accelerator is not None:
+                torch_detected = True
+            else:
+                impl = kwargs.get("implementation")
+                use_torch_flag = kwargs.get("use_torch") is True
+                one_pass_flag = kwargs.get("one_pass_ivfpq") is True
+                torch_centroids = _check_for_torch(ivf_centroids)
+                torch_codebook = _check_for_torch(pq_codebook)
+                if (
+                    (isinstance(impl, str) and impl.lower() == "torch")
+                    or use_torch_flag
+                    or one_pass_flag
+                    or torch_centroids
+                    or torch_codebook
+                ):
+                    torch_detected = True
+        except Exception:
+            # Be conservative: if detection fails, do not modify behavior
+            pass
+
+        if torch_detected:
+            if require_commit:
+                if fragment_ids is not None or index_uuid is not None:
+                    LOGGER.info(
+                        "Torch detected; "
+                        "enforce single-node indexing (distributed is CPU-only)."
+                    )
+                fragment_ids = None
+                index_uuid = None
+            else:
+                if index_uuid is not None:
+                    LOGGER.info(
+                        "Torch detected; "
+                        "enforce single-node indexing (distributed is CPU-only)."
+                    )
+                index_uuid = None
+
+        if accelerator is not None:
+            from .vector import (
+                one_pass_assign_ivf_pq_on_accelerator,
+                one_pass_train_ivf_pq_on_accelerator,
+            )
+
+            LOGGER.info("Doing one-pass ivfpq accelerated computations")
+            if num_partitions is None:
+                num_rows = self.count_rows()
+                num_partitions = _target_partition_size_to_num_partitions(
+                    num_rows, target_partition_size
+                )
+            timers["ivf+pq_train:start"] = time.time()
+            (
+                ivf_centroids,
+                ivf_kmeans,
+                pq_codebook,
+                pq_kmeans_list,
+            ) = one_pass_train_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                num_partitions,
+                metric,
+                accelerator,
+                num_sub_vectors=num_sub_vectors,
+                batch_size=20480,
+                filter_nan=filter_nan,
+            )
+            timers["ivf+pq_train:end"] = time.time()
+            ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
+            LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
+            timers["ivf+pq_assign:start"] = time.time()
+            shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                metric,
+                accelerator,
+                ivf_kmeans,
+                pq_kmeans_list,
+                batch_size=20480,
+                filter_nan=filter_nan,
+            )
+            timers["ivf+pq_assign:end"] = time.time()
+            ivfpq_assign_time = (
+                timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+            )
+            LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
+
+            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                shuffle_output_dir, "data"
+            )
+        if index_type.startswith("IVF"):
+            if (ivf_centroids is not None) and (ivf_centroids_file is not None):
+                raise ValueError(
+                    "ivf_centroids and ivf_centroids_file"
+                    " cannot be provided at the same time"
+                )
+
+            if ivf_centroids_file is not None:
+                from pyarrow.fs import FileSystem
+
+                fs, path = FileSystem.from_uri(ivf_centroids_file)
+                with fs.open_input_file(path) as f:
+                    ivf_centroids = np.load(f)
+                num_partitions = ivf_centroids.shape[0]
+
+            if isinstance(num_partitions, float):
+                warnings.warn("num_partitions is float, converting to int")
+                num_partitions = int(num_partitions)
+            elif num_partitions is not None and not isinstance(num_partitions, int):
+                raise TypeError(
+                    f"num_partitions must be int, got {type(num_partitions)}"
+                )
+            if num_partitions is not None:
+                kwargs["num_partitions"] = num_partitions
+            if target_partition_size is not None:
+                kwargs["target_partition_size"] = target_partition_size
+
+            if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
+                raise ValueError(
+                    "ivf_centroids must be provided when"
+                    " precomputed_partition_dataset is provided"
+                )
+            if precomputed_partition_dataset is not None:
+                LOGGER.info("Using provided precomputed partition dataset")
+                precomputed_ds = LanceDataset(
+                    precomputed_partition_dataset, storage_options=storage_options
+                )
+                if not (
+                    "PQ" in index_type
+                    and pq_codebook is None
+                    and accelerator is not None
+                    and "precomputed_partitions_file" in kwargs
+                ):
+                    # In this case, the precomputed partitions file would be used
+                    # without being turned into a set of precomputed buffers, so it
+                    # needs to have a very specific format
+                    if len(precomputed_ds.get_fragments()) != 1:
+                        raise ValueError(
+                            "precomputed_partition_dataset must have only one fragment"
+                        )
+                    files = precomputed_ds.get_fragments()[0].data_files()
+                    if len(files) != 1:
+                        raise ValueError(
+                            "precomputed_partition_dataset must have only one files"
+                        )
+                kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
+
+            if (ivf_centroids is None) and (pq_codebook is not None):
+                raise ValueError(
+                    "ivf_centroids must be specified when pq_codebook is provided"
+                )
+
+            if ivf_centroids is not None:
+                # User provided IVF centroids
+                if _check_for_numpy(ivf_centroids) and isinstance(
+                    ivf_centroids, np.ndarray
+                ):
+                    if (
+                        len(ivf_centroids.shape) != 2
+                        or ivf_centroids.shape[0] != num_partitions
+                    ):
+                        raise ValueError(
+                            f"Ivf centroids must be 2D array: (clusters, dim), "
+                            f"got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
+                        raise TypeError(
+                            "IVF centroids must be floating number"
+                            + f"got {ivf_centroids.dtype}"
+                        )
+                    dim = ivf_centroids.shape[1]
+                    values = pa.array(ivf_centroids.reshape(-1))
+                    ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
+                kwargs["ivf_centroids"] = pa.RecordBatch.from_arrays(
+                    [ivf_centroids], ["_ivf_centroids"]
+                )
+
+        if "PQ" in index_type:
+            if num_sub_vectors is None:
+                raise ValueError(
+                    "num_partitions and num_sub_vectors are required for IVF_PQ"
+                )
+            kwargs["num_sub_vectors"] = num_sub_vectors
+
+            # Always attach PQ codebook if provided (global training invariant)
+            if pq_codebook is not None:
+                # User provided PQ codebook
+                if _check_for_numpy(pq_codebook) and isinstance(
+                    pq_codebook, np.ndarray
+                ):
+                    if (
+                        len(pq_codebook.shape) != 3
+                        or pq_codebook.shape[0] != num_sub_vectors
+                        or pq_codebook.shape[1] != 256
+                    ):
+                        raise ValueError(
+                            f"PQ codebook must be 3D array: (sub_vectors, 256, dim), "
+                            f"got {pq_codebook.shape}"
+                        )
+                    if pq_codebook.dtype not in [np.float16, np.float32, np.float64]:
+                        raise TypeError(
+                            "PQ codebook must be floating number"
+                            + f"got {pq_codebook.dtype}"
+                        )
+                    values = pa.array(pq_codebook.reshape(-1))
+                    pq_codebook = pa.FixedSizeListArray.from_arrays(
+                        values, pq_codebook.shape[2]
+                    )
+                pq_codebook_batch = pa.RecordBatch.from_arrays(
+                    [pq_codebook], ["_pq_codebook"]
+                )
+                kwargs["pq_codebook"] = pq_codebook_batch
+
+        if shuffle_partition_batches is not None:
+            kwargs["shuffle_partition_batches"] = shuffle_partition_batches
+        if shuffle_partition_concurrency is not None:
+            kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
+
+        if skip_transpose:
+            kwargs["skip_transpose"] = True
+
+        # Add fragment_ids and index_uuid to kwargs if provided for
+        # distributed indexing
+        if fragment_ids is not None:
+            kwargs["fragment_ids"] = fragment_ids
+        if index_uuid is not None:
+            kwargs["index_uuid"] = index_uuid
+
+        timers["final_create_index:start"] = time.time()
+        index = self._ds.create_index(
+            column, index_type, name, replace, train, storage_options, kwargs
+        )
+        timers["final_create_index:end"] = time.time()
+        final_create_index_time = (
+            timers["final_create_index:end"] - timers["final_create_index:start"]
+        )
+        LOGGER.info("Final create_index rust time: %ss", final_create_index_time)
+        # Save disk space
+        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
+            kwargs["precomputed_shuffle_buffers_path"]
+        ):
+            LOGGER.info(
+                "Temporary shuffle buffers stored at %s, you may want to delete it.",
+                kwargs["precomputed_shuffle_buffers_path"],
+            )
+        return index
+
     def create_index(
         self,
         column: Union[str, List[str]],
@@ -2996,329 +3366,120 @@ class LanceDataset(pa.dataset.Dataset):
           <https://hal.inria.fr/inria-00514462v2/document>`_
 
         """
-        # Only support building index for 1 column from the API aspect, however
-        # the internal implementation might support building multi-column index later.
-        if isinstance(column, str):
-            column = [column]
-
-        # validate args
-        for c in column:
-            lance_field = self._ds.lance_schema.field_case_insensitive(c)
-            if lance_field is None:
-                raise KeyError(f"{c} not found in schema")
-            field = lance_field.to_arrow()
-            is_multivec = False
-            if pa.types.is_fixed_size_list(field.type):
-                dimension = field.type.list_size
-            elif pa.types.is_list(field.type) and pa.types.is_fixed_size_list(
-                field.type.value_type
-            ):
-                dimension = field.type.value_type.list_size
-                is_multivec = True
-            elif (
-                isinstance(field.type, pa.FixedShapeTensorType)
-                and len(field.type.shape) == 1
-            ):
-                dimension = field.type.shape[0]
-            else:
-                raise TypeError(
-                    f"Vector column {c} must be FixedSizeListArray "
-                    f"1-dimensional FixedShapeTensorArray, got {field.type}"
-                )
-
-            if num_sub_vectors is not None and dimension % num_sub_vectors != 0:
-                raise ValueError(
-                    f"dimension ({dimension}) must be divisible by num_sub_vectors"
-                    f" ({num_sub_vectors})"
-                )
-
-            element_type = field.type.value_type
-            if is_multivec:
-                element_type = field.type.value_type.value_type
-            if not (
-                pa.types.is_floating(element_type) or pa.types.is_uint8(element_type)
-            ):
-                raise TypeError(
-                    f"Vector column {c} must have floating value type, "
-                    f"got {field.type.value_type}"
-                )
-
-        if not isinstance(metric, str) or metric.lower() not in [
-            "l2",
-            "cosine",
-            "euclidean",
-            "dot",
-            "hamming",
-        ]:
-            raise ValueError(f"Metric {metric} not supported.")
-
-        kwargs["metric_type"] = metric
-
-        index_type = index_type.upper()
-        valid_index_types = [
-            "IVF_FLAT",
-            "IVF_PQ",
-            "IVF_SQ",
-            "IVF_HNSW_FLAT",
-            "IVF_HNSW_PQ",
-            "IVF_HNSW_SQ",
-            "IVF_RQ",
-        ]
-        if index_type not in valid_index_types:
-            raise NotImplementedError(
-                f"Only {valid_index_types} index types supported. Got {index_type}"
-            )
-
-        # Handle timing for various parts of accelerated builds
-        timers = {}
-        if accelerator is not None and index_type != "IVF_PQ":
-            LOGGER.warning(
-                "Index type %s does not support GPU acceleration; falling back to CPU",
-                index_type,
-            )
-            accelerator = None
-
-        # IMPORTANT: Distributed indexing is CPU-only. Enforce single-node when
-        # accelerator or torch-related paths are detected.
-        torch_detected = False
-        try:
-            if accelerator is not None:
-                torch_detected = True
-            else:
-                impl = kwargs.get("implementation")
-                use_torch_flag = kwargs.get("use_torch") is True
-                one_pass_flag = kwargs.get("one_pass_ivfpq") is True
-                torch_centroids = _check_for_torch(ivf_centroids)
-                torch_codebook = _check_for_torch(pq_codebook)
-                if (
-                    (isinstance(impl, str) and impl.lower() == "torch")
-                    or use_torch_flag
-                    or one_pass_flag
-                    or torch_centroids
-                    or torch_codebook
-                ):
-                    torch_detected = True
-        except Exception:
-            # Be conservative: if detection fails, do not modify behavior
-            pass
-
-        if torch_detected:
-            if fragment_ids is not None or index_uuid is not None:
-                LOGGER.info(
-                    "Torch detected; "
-                    "enforce single-node indexing (distributed is CPU-only)."
-                )
-            fragment_ids = None
-            index_uuid = None
-
-        if accelerator is not None:
-            from .vector import (
-                one_pass_assign_ivf_pq_on_accelerator,
-                one_pass_train_ivf_pq_on_accelerator,
-            )
-
-            LOGGER.info("Doing one-pass ivfpq accelerated computations")
-            if num_partitions is None:
-                num_rows = self.count_rows()
-                num_partitions = _target_partition_size_to_num_partitions(
-                    num_rows, target_partition_size
-                )
-            timers["ivf+pq_train:start"] = time.time()
-            (
-                ivf_centroids,
-                ivf_kmeans,
-                pq_codebook,
-                pq_kmeans_list,
-            ) = one_pass_train_ivf_pq_on_accelerator(
-                self,
-                column[0],
-                num_partitions,
-                metric,
-                accelerator,
-                num_sub_vectors=num_sub_vectors,
-                batch_size=20480,
-                filter_nan=filter_nan,
-            )
-            timers["ivf+pq_train:end"] = time.time()
-            ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
-            LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
-            timers["ivf+pq_assign:start"] = time.time()
-            shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
-                self,
-                column[0],
-                metric,
-                accelerator,
-                ivf_kmeans,
-                pq_kmeans_list,
-                batch_size=20480,
-                filter_nan=filter_nan,
-            )
-            timers["ivf+pq_assign:end"] = time.time()
-            ivfpq_assign_time = (
-                timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
-            )
-            LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
-
-            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                shuffle_output_dir, "data"
-            )
-        if index_type.startswith("IVF"):
-            if (ivf_centroids is not None) and (ivf_centroids_file is not None):
-                raise ValueError(
-                    "ivf_centroids and ivf_centroids_file"
-                    " cannot be provided at the same time"
-                )
-
-            if ivf_centroids_file is not None:
-                from pyarrow.fs import FileSystem
-
-                fs, path = FileSystem.from_uri(ivf_centroids_file)
-                with fs.open_input_file(path) as f:
-                    ivf_centroids = np.load(f)
-                num_partitions = ivf_centroids.shape[0]
-
-            if isinstance(num_partitions, float):
-                warnings.warn("num_partitions is float, converting to int")
-                num_partitions = int(num_partitions)
-            elif num_partitions is not None and not isinstance(num_partitions, int):
-                raise TypeError(
-                    f"num_partitions must be int, got {type(num_partitions)}"
-                )
-            if num_partitions is not None:
-                kwargs["num_partitions"] = num_partitions
-            if target_partition_size is not None:
-                kwargs["target_partition_size"] = target_partition_size
-
-            if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
-                raise ValueError(
-                    "ivf_centroids must be provided when"
-                    " precomputed_partition_dataset is provided"
-                )
-            if precomputed_partition_dataset is not None:
-                LOGGER.info("Using provided precomputed partition dataset")
-                precomputed_ds = LanceDataset(
-                    precomputed_partition_dataset, storage_options=storage_options
-                )
-                if not (
-                    "PQ" in index_type
-                    and pq_codebook is None
-                    and accelerator is not None
-                    and "precomputed_partitions_file" in kwargs
-                ):
-                    # In this case, the precomputed partitions file would be used
-                    # without being turned into a set of precomputed buffers, so it
-                    # needs to have a very specific format
-                    if len(precomputed_ds.get_fragments()) != 1:
-                        raise ValueError(
-                            "precomputed_partition_dataset must have only one fragment"
-                        )
-                    files = precomputed_ds.get_fragments()[0].data_files()
-                    if len(files) != 1:
-                        raise ValueError(
-                            "precomputed_partition_dataset must have only one files"
-                        )
-                kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
-
-            if (ivf_centroids is None) and (pq_codebook is not None):
-                raise ValueError(
-                    "ivf_centroids must be specified when pq_codebook is provided"
-                )
-
-            if ivf_centroids is not None:
-                # User provided IVF centroids
-                if _check_for_numpy(ivf_centroids) and isinstance(
-                    ivf_centroids, np.ndarray
-                ):
-                    if (
-                        len(ivf_centroids.shape) != 2
-                        or ivf_centroids.shape[0] != num_partitions
-                    ):
-                        raise ValueError(
-                            f"Ivf centroids must be 2D array: (clusters, dim), "
-                            f"got {ivf_centroids.shape}"
-                        )
-                    if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
-                        raise TypeError(
-                            "IVF centroids must be floating number"
-                            + f"got {ivf_centroids.dtype}"
-                        )
-                    dim = ivf_centroids.shape[1]
-                    values = pa.array(ivf_centroids.reshape(-1))
-                    ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
-                kwargs["ivf_centroids"] = pa.RecordBatch.from_arrays(
-                    [ivf_centroids], ["_ivf_centroids"]
-                )
-
-        if "PQ" in index_type:
-            if num_sub_vectors is None:
-                raise ValueError(
-                    "num_partitions and num_sub_vectors are required for IVF_PQ"
-                )
-            kwargs["num_sub_vectors"] = num_sub_vectors
-
-            # Always attach PQ codebook if provided (global training invariant)
-            if pq_codebook is not None:
-                # User provided PQ codebook
-                if _check_for_numpy(pq_codebook) and isinstance(
-                    pq_codebook, np.ndarray
-                ):
-                    if (
-                        len(pq_codebook.shape) != 3
-                        or pq_codebook.shape[0] != num_sub_vectors
-                        or pq_codebook.shape[1] != 256
-                    ):
-                        raise ValueError(
-                            f"PQ codebook must be 3D array: (sub_vectors, 256, dim), "
-                            f"got {pq_codebook.shape}"
-                        )
-                    if pq_codebook.dtype not in [np.float16, np.float32, np.float64]:
-                        raise TypeError(
-                            "PQ codebook must be floating number"
-                            + f"got {pq_codebook.dtype}"
-                        )
-                    values = pa.array(pq_codebook.reshape(-1))
-                    pq_codebook = pa.FixedSizeListArray.from_arrays(
-                        values, pq_codebook.shape[2]
-                    )
-                pq_codebook_batch = pa.RecordBatch.from_arrays(
-                    [pq_codebook], ["_pq_codebook"]
-                )
-                kwargs["pq_codebook"] = pq_codebook_batch
-
-        if shuffle_partition_batches is not None:
-            kwargs["shuffle_partition_batches"] = shuffle_partition_batches
-        if shuffle_partition_concurrency is not None:
-            kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
-
-        if skip_transpose:
-            kwargs["skip_transpose"] = True
-
-        # Add fragment_ids and index_uuid to kwargs if provided for
-        # distributed indexing
-        if fragment_ids is not None:
-            kwargs["fragment_ids"] = fragment_ids
-        if index_uuid is not None:
-            kwargs["index_uuid"] = index_uuid
-
-        timers["final_create_index:start"] = time.time()
-        self._ds.create_index(
-            column, index_type, name, replace, train, storage_options, kwargs
+        self._create_index_impl(
+            column,
+            index_type,
+            name=name,
+            metric=metric,
+            replace=replace,
+            num_partitions=num_partitions,
+            ivf_centroids=ivf_centroids,
+            pq_codebook=pq_codebook,
+            num_sub_vectors=num_sub_vectors,
+            accelerator=accelerator,
+            index_cache_size=index_cache_size,
+            shuffle_partition_batches=shuffle_partition_batches,
+            shuffle_partition_concurrency=shuffle_partition_concurrency,
+            ivf_centroids_file=ivf_centroids_file,
+            precomputed_partition_dataset=precomputed_partition_dataset,
+            storage_options=storage_options,
+            filter_nan=filter_nan,
+            train=train,
+            fragment_ids=fragment_ids,
+            index_uuid=index_uuid,
+            target_partition_size=target_partition_size,
+            skip_transpose=skip_transpose,
+            require_commit=True,
+            **kwargs,
         )
-        timers["final_create_index:end"] = time.time()
-        final_create_index_time = (
-            timers["final_create_index:end"] - timers["final_create_index:start"]
-        )
-        LOGGER.info("Final create_index rust time: %ss", final_create_index_time)
-        # Save disk space
-        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
-            kwargs["precomputed_shuffle_buffers_path"]
-        ):
-            LOGGER.info(
-                "Temporary shuffle buffers stored at %s, you may want to delete it.",
-                kwargs["precomputed_shuffle_buffers_path"],
-            )
         return self
+
+    def create_index_uncommitted(
+        self,
+        column: Union[str, List[str]],
+        index_type: str,
+        name: Optional[str] = None,
+        metric: str = "L2",
+        replace: bool = False,
+        num_partitions: Optional[int] = None,
+        ivf_centroids: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        pq_codebook: Optional[
+            Union[np.ndarray, pa.FixedSizeListArray, pa.FixedShapeTensorArray]
+        ] = None,
+        num_sub_vectors: Optional[int] = None,
+        accelerator: Optional[Union[str, "torch.Device"]] = None,
+        index_cache_size: Optional[int] = None,
+        shuffle_partition_batches: Optional[int] = None,
+        shuffle_partition_concurrency: Optional[int] = None,
+        ivf_centroids_file: Optional[str] = None,
+        precomputed_partition_dataset: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        filter_nan: bool = True,
+        train: bool = True,
+        fragment_ids: Optional[List[int]] = None,
+        index_uuid: Optional[str] = None,
+        *,
+        target_partition_size: Optional[int] = None,
+        skip_transpose: bool = False,
+        **kwargs,
+    ) -> Index:
+        """
+        Create one uncommitted partial index and return its metadata.
+
+        This is the public shard-build API for distributed index construction.
+        Unlike :meth:`create_index`, this method does not publish the index into
+        the dataset manifest. Instead, it writes one partial index under the
+        staging UUID and returns the resulting :class:`Index` metadata.
+
+        Callers should:
+
+        1. run :meth:`create_index_uncommitted` on each worker with the worker's
+           assigned ``fragment_ids`` and a shared ``index_uuid``
+        2. collect the returned :class:`Index` objects
+        3. pass them to :meth:`IndexSegmentBuilder.with_partial_indices`
+        4. build one or more segments and commit them with
+           :meth:`commit_existing_index_segments`
+
+        Parameters are the same as :meth:`create_index`, with two additional
+        requirements for distributed shard build:
+
+        - ``fragment_ids`` must be provided
+        - workers that belong to the same distributed build must share the same
+          ``index_uuid``
+
+        Returns
+        -------
+        Index
+            Metadata for the partial index that was written by this call.
+        """
+        return self._create_index_impl(
+            column,
+            index_type,
+            name=name,
+            metric=metric,
+            replace=replace,
+            num_partitions=num_partitions,
+            ivf_centroids=ivf_centroids,
+            pq_codebook=pq_codebook,
+            num_sub_vectors=num_sub_vectors,
+            accelerator=accelerator,
+            index_cache_size=index_cache_size,
+            shuffle_partition_batches=shuffle_partition_batches,
+            shuffle_partition_concurrency=shuffle_partition_concurrency,
+            ivf_centroids_file=ivf_centroids_file,
+            precomputed_partition_dataset=precomputed_partition_dataset,
+            storage_options=storage_options,
+            filter_nan=filter_nan,
+            train=train,
+            fragment_ids=fragment_ids,
+            index_uuid=index_uuid,
+            target_partition_size=target_partition_size,
+            skip_transpose=skip_transpose,
+            require_commit=False,
+            **kwargs,
+        )
 
     def drop_index(self, name: str):
         """
@@ -3390,6 +3551,26 @@ class LanceDataset(pa.dataset.Dataset):
         # Merge physical index files at the index directory
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead)
         return None
+
+    def create_index_segment_builder(self, staging_index_uuid: str):
+        """
+        Create a builder for turning partial index outputs into committed segments.
+
+        The caller should pass the shared index UUID used during
+        :meth:`create_index` with ``fragment_ids=...`` and ``index_uuid=...``.
+        Then provide the returned partial index metadata through
+        :meth:`IndexSegmentBuilder.with_partial_indices`.
+        """
+        return self._ds.create_index_segment_builder(staging_index_uuid)
+
+    def commit_existing_index_segments(
+        self, index_name: str, column: str, segments: List[IndexSegment]
+    ) -> LanceDataset:
+        """
+        Commit built index segments as one logical index.
+        """
+        self._ds.commit_existing_index_segments(index_name, column, segments)
+        return self
 
     def session(self) -> Session:
         """
@@ -4227,6 +4408,14 @@ class ExecuteResult(TypedDict):
 
 
 @dataclass
+class IndexFile:
+    """Metadata about a file in an index segment."""
+
+    path: str
+    size_bytes: int
+
+
+@dataclass
 class Index:
     """Represents an index in the dataset."""
 
@@ -4238,6 +4427,7 @@ class Index:
     index_version: int
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
+    files: Optional[List["IndexFile"]] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -5342,12 +5532,12 @@ class DatasetOptimizer:
     def compact_files(
         self,
         *,
-        target_rows_per_fragment: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
         max_bytes_per_file: Optional[int] = None,
-        materialize_deletions: bool = True,
-        materialize_deletions_threshold: float = 0.1,
-        defer_index_remap: bool = False,
+        materialize_deletions: Optional[bool] = None,
+        materialize_deletions_threshold: Optional[float] = None,
+        defer_index_remap: Optional[bool] = None,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
         compaction_mode: Optional[
@@ -5369,14 +5559,33 @@ class DatasetOptimizer:
         not be compacted because the fragments it is adjacent to do not need
         compaction.
 
+        Default values for these options can be stored in the dataset manifest
+        config using keys prefixed with ``lance.compaction.``. For example,
+        setting the config key ``lance.compaction.target_rows_per_fragment`` to
+        ``"500000"`` will use 500,000 as the default target rows per fragment.
+        Explicitly provided parameters take precedence over manifest config
+        values, which in turn take precedence over hardcoded defaults.
+
+        Supported config keys: ``lance.compaction.target_rows_per_fragment``,
+        ``lance.compaction.max_rows_per_group``,
+        ``lance.compaction.max_bytes_per_file``,
+        ``lance.compaction.materialize_deletions``,
+        ``lance.compaction.materialize_deletions_threshold``,
+        ``lance.compaction.defer_index_remap``,
+        ``lance.compaction.batch_size``,
+        ``lance.compaction.compaction_mode``,
+        ``lance.compaction.binary_copy_read_batch_bytes``.
+
         Parameters
         ----------
-        target_rows_per_fragment: int, default 1024*1024
+        target_rows_per_fragment: int, optional
             The target number of rows per fragment. This is the number of rows
-            that will be in each fragment after compaction.
-        max_rows_per_group: int, default 1024
+            that will be in each fragment after compaction. If not specified,
+            uses the manifest config value, or 1024*1024.
+        max_rows_per_group: int, optional
             Max number of rows per group. This does not affect which fragments
             need compaction, but does affect how they are re-written if selected.
+            If not specified, uses the manifest config value, or 1024.
 
             This setting only affects datasets using the legacy storage format.
             The newer format does not require row groups.
@@ -5387,14 +5596,17 @@ class DatasetOptimizer:
             that are smaller than `target_rows_per_fragment`.
 
             The default will use the default from ``write_dataset``.
-        materialize_deletions: bool, default True
+        materialize_deletions: bool, optional
             Whether to compact fragments with soft deleted rows so they are no
-            longer present in the file.
-        materialize_deletions_threshold: float, default 0.1
+            longer present in the file. If not specified, uses the manifest
+            config value, or True.
+        materialize_deletions_threshold: float, optional
             The fraction of original rows that are soft deleted in a fragment
-            before the fragment is a candidate for compaction.
-        defer_index_remap: bool, default False
-            Whether to defer index remapping during compaction.
+            before the fragment is a candidate for compaction. If not specified,
+            uses the manifest config value, or 0.1.
+        defer_index_remap: bool, optional
+            Whether to defer index remapping during compaction. If not specified,
+            uses the manifest config value, or False.
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
@@ -5425,18 +5637,22 @@ class DatasetOptimizer:
         --------
         lance.optimize.Compaction
         """
-        opts = dict(
-            target_rows_per_fragment=target_rows_per_fragment,
-            max_rows_per_group=max_rows_per_group,
-            max_bytes_per_file=max_bytes_per_file,
-            materialize_deletions=materialize_deletions,
-            materialize_deletions_threshold=materialize_deletions_threshold,
-            defer_index_remap=defer_index_remap,
-            num_threads=num_threads,
-            batch_size=batch_size,
-            compaction_mode=compaction_mode,
-            binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
-        )
+        opts = {
+            k: v
+            for k, v in dict(
+                target_rows_per_fragment=target_rows_per_fragment,
+                max_rows_per_group=max_rows_per_group,
+                max_bytes_per_file=max_bytes_per_file,
+                materialize_deletions=materialize_deletions,
+                materialize_deletions_threshold=materialize_deletions_threshold,
+                defer_index_remap=defer_index_remap,
+                num_threads=num_threads,
+                batch_size=batch_size,
+                compaction_mode=compaction_mode,
+                binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
+            ).items()
+            if v is not None
+        }
         return Compaction.execute(self._dataset, opts)
 
     def optimize_indices(self, **kwargs):

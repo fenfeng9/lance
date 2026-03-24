@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 
-use crate::{IndexParams, IndexType, optimize::OptimizeOptions};
+use crate::{IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
 use lance_table::format::IndexMetadata;
-use uuid::Uuid;
 
 /// A set of criteria used to filter potential indices to use for a query
 #[derive(Debug, Default)]
@@ -115,12 +114,21 @@ pub trait IndexDescription: Send + Sync {
     /// plugin.  As a result, this method may fail if there is no plugin
     /// available for the index.
     fn details(&self) -> Result<String>;
+
+    /// Returns the total size in bytes of all files across all segments.
+    ///
+    /// Returns `None` if file size information is not available for any segment
+    /// (for backward compatibility with indices created before file tracking was added).
+    fn total_size_bytes(&self) -> Option<u64>;
 }
 
 // Extends Lance Dataset with secondary index.
 #[async_trait]
 pub trait DatasetIndexExt {
     type IndexBuilder<'a>
+    where
+        Self: 'a;
+    type IndexSegmentBuilder<'a>
     where
         Self: 'a;
 
@@ -139,6 +147,21 @@ pub trait DatasetIndexExt {
         index_type: IndexType,
         params: &'a dyn IndexParams,
     ) -> Self::IndexBuilder<'a>;
+
+    /// Create a builder for building index segments from partial index outputs.
+    ///
+    /// The staging UUID identifies a directory containing previously-built shard
+    /// outputs. The caller supplies the partial index metadata returned by
+    /// `execute_uncommitted()` so the builder can plan segment grouping without
+    /// rediscovering shard coverage.
+    ///
+    /// This is the canonical entry point for distributed vector segment build.
+    /// After building the physical segments, publish them as a
+    /// logical index with [`Self::commit_existing_index_segments`].
+    fn create_index_segment_builder<'a>(
+        &'a self,
+        staging_index_uuid: String,
+    ) -> Self::IndexSegmentBuilder<'a>;
 
     /// Create indices on columns.
     ///
@@ -269,11 +292,17 @@ pub trait DatasetIndexExt {
     /// If the index does not exist, return Error.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
-    async fn commit_existing_index(
+    /// Commit one or more existing physical index segments as a logical index.
+    ///
+    /// This publishes already-built physical segments. It does not build
+    /// or merge index data; callers should first build segments with
+    /// [`Self::create_index_segment_builder`] or another index-specific build
+    /// path and then pass the resulting segments here.
+    async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
         column: &str,
-        index_id: Uuid,
+        segments: Vec<IndexSegment>,
     ) -> Result<()>;
 
     async fn read_index_partition(

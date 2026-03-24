@@ -68,7 +68,8 @@ impl InvertedIndexPlugin {
         inverted_index.update(data, index_store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: INVERTED_INDEX_VERSION,
+            index_version: current_fts_format_version().index_version(),
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 
@@ -137,7 +138,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        INVERTED_INDEX_VERSION
+        max_supported_fts_format_version().index_version()
     }
 
     fn new_query_parser(
@@ -212,5 +213,19 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
         let index_params = InvertedIndexParams::try_from(&index_details)?;
         Ok(serde_json::json!(&index_params))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plugin_version_tracks_max_supported_format() {
+        let plugin = InvertedIndexPlugin;
+        assert_eq!(
+            plugin.version(),
+            max_supported_fts_format_version().index_version()
+        );
     }
 }

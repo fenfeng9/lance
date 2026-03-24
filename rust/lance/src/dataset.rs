@@ -1776,6 +1776,27 @@ impl Dataset {
         Ok(versions)
     }
 
+    /// List all detached manifest locations.
+    ///
+    /// Detached manifests are versions that are not part of the main version history.
+    /// They are created by `commit_detached` and can be used for staging changes.
+    ///
+    /// To read transaction properties from a detached manifest:
+    /// ```ignore
+    /// let detached = dataset.list_detached_manifests().await?;
+    /// for location in detached {
+    ///     let ds = dataset.checkout_version(location.version).await?;
+    ///     let tx = ds.read_transaction().await?;
+    ///     // Access tx.transaction_properties
+    /// }
+    /// ```
+    pub async fn list_detached_manifests(&self) -> Result<Vec<ManifestLocation>> {
+        self.commit_handler
+            .list_detached_manifest_locations(&self.base, &self.object_store)
+            .try_collect()
+            .await
+    }
+
     /// Get the latest version of the dataset
     /// This is meant to be a fast path for checking if a dataset has changed. This is why
     /// we don't return the full version struct.
@@ -1815,6 +1836,11 @@ impl Dataset {
             .iter()
             .map(|f| FileFragment::new(dataset.clone(), f.clone()))
             .collect()
+    }
+
+    /// Iterate over manifest fragments without allocating [`FileFragment`] wrappers.
+    pub fn iter_fragments(&self) -> impl Iterator<Item = &Fragment> {
+        self.manifest.fragments.iter()
     }
 
     pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
@@ -2658,6 +2684,7 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
+    /// Merge a staged distributed index into a single root artifact.
     pub async fn merge_index_metadata(
         &self,
         index_uuid: &str,
@@ -2688,14 +2715,59 @@ impl Dataset {
             }
             // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
-                // Merge distributed vector index partials and finalize root index via Lance IVF helper
-                crate::index::vector::ivf::finalize_distributed_merge(
-                    self.object_store(),
+                let mut partial_indices = self
+                    .object_store()
+                    .read_dir(index_dir.clone())
+                    .await?
+                    .into_iter()
+                    .filter(|name| name.starts_with("partial_"))
+                    .map(|name| {
+                        name.strip_prefix("partial_")
+                            .ok_or_else(|| {
+                                Error::index(format!(
+                                    "Distributed vector shard '{}' does not start with 'partial_'",
+                                    name
+                                ))
+                            })
+                            .and_then(|shard_uuid| {
+                                uuid::Uuid::parse_str(shard_uuid).map_err(|err| {
+                                    Error::index(format!(
+                                        "Distributed vector shard '{}' does not end with a valid UUID: {}",
+                                        name, err
+                                    ))
+                                })
+                            })
+                            .map(|shard_uuid| IndexMetadata {
+                                uuid: shard_uuid,
+                                name: String::new(),
+                                fields: Vec::new(),
+                                dataset_version: self.manifest.version,
+                                fragment_bitmap: Some(RoaringBitmap::new()),
+                                index_details: None,
+                                index_version: index_type.version(),
+                                created_at: None,
+                                base_id: None,
+                                files: Some(Vec::new()),
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                partial_indices.sort_by_key(|index| index.uuid);
+                let segment_plans = crate::index::vector::ivf::plan_staging_segments(
                     &index_dir,
+                    &partial_indices,
                     Some(index_type),
+                    None,
                 )
                 .await?;
-                Ok(())
+                let merged_plan =
+                    crate::index::vector::ivf::collapse_segment_plans(&segment_plans)?;
+                crate::index::vector::ivf::build_staging_segment(
+                    self.object_store(),
+                    &self.indices_dir(),
+                    &merged_plan,
+                )
+                .await
+                .map(|_| ())
             }
             _ => Err(Error::invalid_input_source(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

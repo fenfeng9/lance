@@ -341,6 +341,7 @@ impl BlockingDataset {
         storage_format: Option<LanceFileVersion>,
         max_retries: u32,
         skip_auto_cleanup: bool,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
@@ -357,6 +358,9 @@ impl BlockingDataset {
         }
         if skip_auto_cleanup {
             builder = builder.with_skip_auto_cleanup(true);
+        }
+        if let Some(handler) = commit_handler {
+            builder = builder.with_commit_handler(handler);
         }
         let new_dataset = RT.block_on(builder.execute(transaction))?;
         Ok(BlockingDataset { inner: new_dataset })
@@ -2541,7 +2545,12 @@ fn inner_compact(
     java_dataset: JObject,
     compaction_options: JObject, // CompactionOptions
 ) -> Result<()> {
-    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options)?;
+    let config = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        dataset.inner.manifest.config.clone()
+    };
+    let rust_options = convert_java_compaction_options_to_rust(env, compaction_options, &config)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.compact(rust_options)?;
@@ -2551,6 +2560,7 @@ fn inner_compact(
 fn convert_java_compaction_options_to_rust(
     env: &mut JNIEnv,
     java_options: JObject,
+    config: &std::collections::HashMap<String, String>,
 ) -> Result<RustCompactionOptions> {
     let target_rows_per_fragment = env
         .call_method(
@@ -2627,6 +2637,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let max_source_fragments = env
+        .call_method(
+            &java_options,
+            "getMaxSourceFragments",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -2640,6 +2658,8 @@ fn convert_java_compaction_options_to_rust(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &max_source_fragments,
+        config,
     )
 }
 
